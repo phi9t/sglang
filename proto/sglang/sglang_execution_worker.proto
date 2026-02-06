@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package sglang.grpc.execution;
+
+import "google/protobuf/struct.proto";
+
+// Rust scheduler/control-plane -> Python/Torch execution worker boundary.
+//
+// Ferric scope:
+// - Scheduler/cache/rpc orchestration is moved to Rust.
+// - Torch model execution and CUDA/Triton kernels remain in Python/C++/CUDA.
+//
+// This contract freezes the execution boundary and should be versioned carefully.
+service SglangExecutionWorker {
+  // Execute one prefill/extend batch.
+  rpc ExecutePrefill(ExecuteBatchRequest) returns (ExecuteBatchResponse);
+
+  // Execute one decode batch.
+  rpc ExecuteDecode(ExecuteBatchRequest) returns (ExecuteBatchResponse);
+
+  // Cancel a request inside worker-internal execution context.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+
+  // Health/readiness probe.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Worker capabilities and metadata.
+  rpc GetWorkerInfo(GetWorkerInfoRequest) returns (GetWorkerInfoResponse);
+}
+
+enum BatchStatus {
+  BATCH_STATUS_UNSPECIFIED = 0;
+  BATCH_STATUS_OK = 1;
+  BATCH_STATUS_RETRYABLE_ERROR = 2;
+  BATCH_STATUS_FATAL_ERROR = 3;
+}
+
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;
+  FINISH_REASON_LENGTH = 2;
+  FINISH_REASON_ABORT = 3;
+  FINISH_REASON_FILTER = 4;
+}
+
+enum TensorStorageKind {
+  TENSOR_STORAGE_UNSPECIFIED = 0;
+  TENSOR_STORAGE_INLINE = 1;
+  TENSOR_STORAGE_SHM = 2;
+  TENSOR_STORAGE_CUDA_IPC = 3;
+  TENSOR_STORAGE_EXTERNAL = 4;
+}
+
+message TensorRef {
+  TensorStorageKind storage_kind = 1;
+  string handle = 2;
+  repeated int64 shape = 3;
+  string dtype = 4;
+  int64 nbytes = 5;
+}
+
+message RequestSlice {
+  string request_id = 1;
+
+  // Logical offsets into flattened arrays carried by ExecuteBatchRequest.
+  uint32 input_ids_offset = 2;
+  uint32 input_ids_length = 3;
+
+  uint32 seq_lens_offset = 4;
+  uint32 req_pool_index_offset = 5;
+  uint32 out_cache_loc_offset = 6;
+
+  // Per-request control metadata.
+  string lora_id = 7;
+  int32 priority = 8;
+  bool return_hidden_states = 9;
+  bool return_hidden_states_before_norm = 10;
+
+  // Optional extension for model-/feature-specific metadata.
+  google.protobuf.Struct extension = 11;
+}
+
+message ExecuteBatchRequest {
+  // Idempotency key for this execution attempt.
+  string batch_id = 1;
+
+  // Worker identity/routing metadata.
+  int32 tp_rank = 2;
+  int32 dp_rank = 3;
+  int32 pp_rank = 4;
+
+  // Flattened batch tensors represented as scalar arrays for portability.
+  // v1 keeps these host-side and allows worker to stage/transfer as needed.
+  repeated uint32 input_ids = 5;
+  repeated uint32 req_pool_indices = 6;
+  repeated uint32 out_cache_loc = 7;
+  repeated uint32 seq_lens = 8;
+  uint32 seq_lens_sum = 9;
+
+  // Request slicing metadata.
+  repeated RequestSlice requests = 10;
+
+  // Logprob / sampling-related flags.
+  bool return_logprob = 11;
+  repeated uint32 top_logprobs_nums = 12;
+
+  // Optional pre-staged tensor handles for advanced paths.
+  repeated TensorRef input_tensors = 13;
+
+  // Model-/feature-specific extension payload.
+  google.protobuf.Struct extension = 14;
+}
+
+message RequestExecutionResult {
+  string request_id = 1;
+  bool finished = 2;
+  FinishReason finish_reason = 3;
+
+  uint32 prompt_tokens = 4;
+  uint32 completion_tokens = 5;
+  uint32 cached_tokens = 6;
+
+  // Next token for decode or final token for completed prefill-only requests.
+  uint32 next_token_id = 7;
+  float next_token_logprob = 8;
+
+  // Optional serialized text fragment (for debugging/parity tooling).
+  string text_fragment = 9;
+
+  // Optional extension payload.
+  google.protobuf.Struct extension = 10;
+}
+
+message ExecuteBatchResponse {
+  string batch_id = 1;
+  BatchStatus status = 2;
+  string error_message = 3;
+
+  repeated RequestExecutionResult results = 4;
+
+  // Optional tensor outputs (e.g., hidden states, logits references).
+  repeated TensorRef output_tensors = 5;
+
+  // Worker metrics snapshot for scheduling feedback.
+  uint32 num_running_reqs = 6;
+  uint32 num_waiting_reqs = 7;
+  uint64 num_used_tokens = 8;
+  uint64 max_total_tokens = 9;
+
+  google.protobuf.Struct extension = 10;
+}
+
+message CancelRequest {
+  string request_id = 1;
+}
+
+message CancelResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  bool ready = 2;
+  string detail = 3;
+}
+
+message GetWorkerInfoRequest {}
+
+message GetWorkerInfoResponse {
+  string worker_id = 1;
+  string model_path = 2;
+  string model_impl = 3;
+  string device = 4;
+
+  int32 tp_size = 5;
+  int32 dp_size = 6;
+  int32 pp_size = 7;
+
+  bool supports_lora = 8;
+  bool supports_hidden_states = 9;
+  bool supports_multimodal = 10;
+
+  google.protobuf.Struct extension = 11;
+}

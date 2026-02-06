@@ -11,8 +11,17 @@ macro_rules! set_env {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let canonical_proto_dir = "../proto/sglang";
+
     // Rebuild triggers
-    println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
+    println!(
+        "cargo:rerun-if-changed={}/sglang_scheduler.proto",
+        canonical_proto_dir
+    );
+    println!(
+        "cargo:rerun-if-changed={}/sglang_execution_worker.proto",
+        canonical_proto_dir
+    );
     println!("cargo:rerun-if-changed=src/proto/vllm_engine.proto");
     println!("cargo:rerun-if-changed=Cargo.toml");
 
@@ -24,10 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
             &[
-                "src/proto/sglang_scheduler.proto",
+                "../proto/sglang/sglang_scheduler.proto",
+                "../proto/sglang/sglang_execution_worker.proto",
                 "src/proto/vllm_engine.proto",
             ],
-            &["src/proto"],
+            &["../proto/sglang", "src/proto"],
         )?;
 
     // Set version info environment variables

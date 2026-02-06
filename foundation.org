@@ -1,0 +1,766 @@
+#+TITLE: SGLang Runtime Deep Dive (Foundation)
+#+AUTHOR: Codex
+#+DATE: 2026-03-11
+
+* Purpose and Continuation Notes
+This document continues and refines the prior deep-dive notes in
+~2026-02-09-do-a-thorough-deep-dive-of-this-code-base.txt~ into an
+Org-mode, implementation-oriented reference.
+
+Primary scope is ~python/sglang/srt~ (runtime internals), with brief context
+for adjacent subsystems (~python/sglang/lang~, ~sgl-kernel~, ~sgl-model-gateway~).
+
+* Reading Guide
+- If you want request lifecycle: start at [[*Core Execution Path][Core Execution Path]].
+- If you want the full end-to-end trace: [[*Full Request Execution Path Trace][Full Request Execution Path Trace]].
+- If you want scheduler behavior: jump to [[*Scheduler Deep Dive][Scheduler Deep Dive]].
+- If you want prefix-cache behavior: jump to [[*Radix Cache and Memory Subsystem][Radix Cache and Memory Subsystem]].
+- If you want model executor internals: [[*Model Executor Deep Dive][Model Executor Deep Dive]].
+- If you want ModelRunner specifically: [[*ModelRunner Deep Dive][ModelRunner Deep Dive]].
+- If you want knobs/commands: jump to [[*Operational Examples][Operational Examples]].
+
+* System Architecture
+** High-level serving pipeline
+#+begin_example
+Client (HTTP/gRPC/Python API)
+  -> Entry point (launch_server / Engine)
+  -> TokenizerManager (tokenization, multimodal preprocess, request state)
+  -> Scheduler (batching, policy, cache-aware admission, forward orchestration)
+  -> Model Executor (prefill/decode forward on device)
+  -> DetokenizerManager (token -> text streaming)
+  -> Client response
+#+end_example
+
+** Process model (runtime)
+From ~python/sglang/srt/entrypoints/engine.py~ (~Engine~ docstring):
+- TokenizerManager runs in main process.
+- Scheduler runs in subprocess.
+- DetokenizerManager runs in subprocess.
+- IPC is ZMQ-based via dedicated ports.
+
+** Design intents visible in code
+- Continuous batching and overlap path in scheduler loop.
+- Cache-aware scheduling (LPM/DFS) integrated with radix prefix cache.
+- Pluggable execution modes and feature mixins:
+  - disaggregation (prefill/decode split)
+  - speculative decoding
+  - LoRA dynamic loading
+  - DP/PP attention paths
+  - multiplexing and metrics/tracing hooks
+
+* Codebase Topology (SRT-centric)
+** Key directory groups under ~python/sglang/srt~
+- ~entrypoints/~: server and engine entry points (HTTP/gRPC/Engine bridge).
+- ~managers/~: runtime orchestration (scheduler, tokenizer, detokenizer, policies).
+- ~mem_cache/~: radix cache tree, memory pools, hierarchical storage backends.
+- ~model_executor/~: forward runners, batch tensorization, CUDA/CPU graph runners.
+- ~models/~: model implementations and adapters.
+- ~layers/~: attention, quantization, MoE, low-level layer components.
+- ~sampling/~, ~constrained/~: token selection and constrained decoding backends.
+- ~disaggregation/~: prefill/decode separation and transfer queues/backends.
+- ~lora/~, ~speculative/~, ~multiplex/~, ~weight_sync/~: optional performance/runtime features.
+
+** Adjacent subsystems (context)
+- ~python/sglang/lang~: frontend DSL/API layer (~gen~, ~select~, ~function~).
+- ~sgl-kernel~: CUDA/C++ kernel implementations used by runtime/layers.
+- ~sgl-model-gateway~: Rust routing/load-balancing/control-plane layer.
+
+* Core Execution Path
+** Engine and subprocess orchestration
+File: ~python/sglang/srt/entrypoints/engine.py~
+- ~Engine~ launches tokenizer manager and scheduler/detokenizer subprocesses.
+- Initializes template manager and ZMQ sockets.
+- Exposes generation/embedding/admin-facing runtime APIs.
+
+** TokenizerManager responsibilities
+File: ~python/sglang/srt/managers/tokenizer_manager.py~
+- Parses/normalizes incoming request payloads.
+- Tokenizes text and prepares multimodal payloads.
+- Maintains per-request state for streaming, logprobs, and completion tracking.
+- Communicates tokenized requests to scheduler; receives partial outputs.
+
+** Scheduler main loop contract
+File: ~python/sglang/srt/managers/scheduler.py~
+- Canonical cycle is represented by methods around:
+  - ~recv_requests()~
+  - ~process_input_requests()~
+  - ~get_next_batch_to_run()~
+  - ~run_batch()~
+  - ~process_batch_result()~
+- Mixins compose behavior for metrics, profiling, DP/PP paths, output processing,
+  runtime checks, and weight updates.
+
+** Model execution handoff
+Files: ~python/sglang/srt/model_executor/*~
+- Scheduler forms batch metadata and dispatches to model runner.
+- Two dominant forward phases:
+  - prefill/extend (prompt ingestion)
+  - decode (autoregressive token-by-token generation)
+
+* Scheduler Deep Dive
+** Composition
+~Scheduler~ inherits from multiple mixins, including:
+- ~SchedulerOutputProcessorMixin~
+- ~SchedulerUpdateWeightsMixin~
+- ~SchedulerProfilerMixin~
+- ~SchedulerMetricsMixin~
+- ~SchedulerDisaggregationDecodeMixin~
+- ~SchedulerDisaggregationPrefillMixin~
+- ~SchedulerMultiplexMixin~
+- ~SchedulerRuntimeCheckerMixin~
+- ~SchedulerPPMixin~
+- ~SchedulerDPAttnMixin~
+
+This shape lets the scheduler keep a single event loop while attaching optional
+features without moving the loop contract.
+
+** Policy engine
+File: ~python/sglang/srt/managers/schedule_policy.py~
+- Cache-aware policies:
+  - ~lpm~ (longest prefix match)
+  - ~dfs-weight~
+- Cache-agnostic policies:
+  - ~fcfs~, ~lof~, ~random~, ~routing-key~
+- Key behavior:
+  - Computes prefix matches via radix cache for waiting requests.
+  - Applies optional in-batch prefix-caching heuristics.
+  - Reorders waiting queue based on policy and priority controls.
+
+** Scheduler <-> cache coupling
+- Scheduling logic reads:
+  - prefix lengths (~match_prefix~ results)
+  - evictable token capacity (~evictable_size~, ~full_evictable_size~, etc.)
+- Admission decisions are therefore cache-state-sensitive, not pure queue order.
+
+* Radix Cache and Memory Subsystem
+** Radix tree core
+File: ~python/sglang/srt/mem_cache/radix_cache.py~
+- Main types:
+  - ~RadixKey~: token sequence + optional ~extra_key~ (e.g., LoRA/cache salt).
+  - ~TreeNode~: tree structure, value pointers, lock/host refs, metrics fields.
+  - ~RadixCache~: implementation of prefix cache operations.
+
+** Critical operations
+- ~match_prefix(...)~:
+  - finds longest matched token prefix in device cache
+  - returns indices and relevant nodes for subsequent scheduling/execution
+- ~insert(...)~:
+  - inserts new token pages/segments into tree
+- ~evict(...)~:
+  - evicts leaves by configured policy when space is required
+
+** Eviction strategies
+Configured in ~RadixCache~:
+- ~lru~, ~lfu~, ~fifo~, ~mru~, ~filo~, ~priority~
+(via ~mem_cache/evict_policy.py~ strategy classes).
+
+** Cache variants and hierarchy
+- ~hiradix_cache.py~: hierarchical cache behavior (device/host/storage).
+- ~swa_radix_cache.py~: sliding-window attention variant.
+- ~mamba_radix_cache.py~: variant for Mamba/SSM style needs.
+- ~radix_cache_cpp.py~ + ~cpp_radix_tree/*~: C++ accelerated tree path.
+
+** Memory pools and initialization parameters
+- ~mem_cache/cache_init_params.py~ provides cache init contract:
+  - ~req_to_token_pool~
+  - ~token_to_kv_pool_allocator~
+  - ~page_size~, eviction policy, metrics/event toggles, etc.
+- Pools and allocators live in ~memory_pool.py~, ~allocator.py~, and host/cache
+  coordination via ~memory_pool_host.py~, ~cache_controller.py~.
+
+* Curated Import Maps (Key Modules)
+** ~managers/scheduler.py~
+| Imported subsystem                 | Why it exists in scheduler                           |
+|------------------------------------+------------------------------------------------------|
+| ~managers/schedule_policy~           | Queue ordering and admission policy logic            |
+| ~managers/schedule_batch~            | Request/batch data structures (~Req~, ~ScheduleBatch~)   |
+| ~mem_cache/radix_cache~ (+ variants) | Prefix matching and KV cache reuse                   |
+| ~model_executor/forward_batch_info~  | Batch forwarding metadata/types                      |
+| ~disaggregation/*~                   | Prefill/decode split queues and transfer controls    |
+| ~scheduler_*_mixin~ files            | Metrics/profiler/PP/DP/runtime-check/output features |
+| ~lora/lora_overlap_loader~           | Async LoRA adapter load overlap integration          |
+| ~parser/reasoning_parser~            | Reasoning output parsing integration                 |
+| ~tracing/trace~                      | OpenTelemetry tracing spans/events                   |
+
+** ~managers/schedule_policy.py~
+| Imported subsystem          | Why it exists in policy layer                           |
+|-----------------------------+---------------------------------------------------------|
+| ~mem_cache/base_prefix_cache~ | Abstract cache interface dependency                     |
+| ~mem_cache/radix_cache~       | Prefix match/in-batch simulated tree usage              |
+| ~managers/schedule_batch~     | Access to request fields used for sorting/admission     |
+| ~layers/attention/nsa/utils~  | NSA context-parallel constraints in policy calculations |
+| ~dllm/config~                 | DLLM scheduling-specific configuration                  |
+
+** ~mem_cache/radix_cache.py~
+| Imported subsystem          | Why it exists in radix cache                                  |
+|-----------------------------+---------------------------------------------------------------|
+| ~mem_cache/base_prefix_cache~ | Interface + params/results types                              |
+| ~mem_cache/evict_policy~      | Policy strategy object for eviction ordering                  |
+| ~mem_cache/hicache_storage~   | Hash chaining utilities for page identity/storage integration |
+| ~disaggregation/kv_events~    | Optional cache event signaling hooks                          |
+
+** ~entrypoints/engine.py~
+| Imported subsystem                | Why it exists in engine                        |
+|-----------------------------------+------------------------------------------------|
+| ~managers/tokenizer_manager~        | In-process tokenization front controller       |
+| ~managers/scheduler~                | Launch scheduler subprocess                    |
+| ~managers/detokenizer_manager~      | Launch detokenizer subprocess                  |
+| ~managers/data_parallel_controller~ | DP orchestration process support               |
+| ~server_args~, ~utils~, ~tracing~       | runtime config/process utils and observability |
+
+** ~managers/tokenizer_manager.py~
+| Imported subsystem                  | Why it exists in tokenizer manager             |
+|-------------------------------------+------------------------------------------------|
+| ~configs/model_config~                | tokenizer/model capability metadata            |
+| ~managers/io_struct~                  | request/response IPC schemas                   |
+| ~managers/multimodal_processor~       | image/video/audio preprocessing hooks          |
+| ~managers/async_*~                    | async tokenization and MM processing pipelines |
+| ~sampling/sampling_params~            | request sampling normalization/validation      |
+| ~metrics/*~, ~request_logger~, ~watchdog~ | operational metrics, logging, and health       |
+
+* Operational Examples
+All commands assume repo root and a working Python environment with SGLang
+installed and model access configured.
+
+** 1) Basic server launch + OpenAI-compatible request
+#+begin_src bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --host 0.0.0.0 --port 30000
+
+curl -s http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role":"user","content":"Summarize radix cache behavior in one sentence."}],
+    "max_tokens": 64,
+    "temperature": 0.2
+  }'
+#+end_src
+
+** 2) Scheduler policy tuning
+#+begin_src bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --schedule-policy lpm \
+  --chunked-prefill-size 4096 \
+  --max-running-requests 256
+#+end_src
+
+Use ~lpm~ when prefix reuse is expected; use ~fcfs~ when cache locality is weak or
+policy overhead is not worth it for a workload.
+
+** 3) Cache behavior controls
+#+begin_src bash
+# Disable radix cache for workloads where caching may hurt correctness/utility
+# for the request type (for example, selected multimodal/reranker cases)
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-Reranker-0.6B \
+  --disable-radix-cache
+
+# Enable cache with explicit eviction strategy
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --radix-eviction-policy lru
+#+end_src
+
+** 4) Throughput-oriented parallelism knobs
+#+begin_src bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --tp 2 --dp 2 --enable-metrics
+#+end_src
+
+For production DP routing, use model gateway/router layer rather than manual
+client-side worker selection.
+
+** 5) Observability/debug profile
+#+begin_src bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --enable-metrics \
+  --log-level info \
+  --watchdog-timeout 300 \
+  --decode-log-interval 40
+#+end_src
+
+* Troubleshooting Playbooks
+** OOM during prefill or large context runs
+- Lower ~--mem-fraction-static~.
+- Lower ~--chunked-prefill-size~.
+- Reduce ~--max-running-requests~.
+- Consider smaller TP/DP footprint depending on topology.
+
+** High queueing latency / request retractions
+- Increase scheduling conservativeness (~--schedule-conservativeness~).
+- Revisit policy (~lpm~ vs ~fcfs~) based on real prefix locality.
+- Tune ~--max-running-requests~ and ~--max-prefill-tokens~.
+
+** Low cache hit value
+- Validate prompt prefix reuse patterns for workload.
+- Confirm cache is enabled and page size/policy are sensible.
+- Inspect whether request-specific ~extra_key~ separation (e.g., LoRA variants)
+  is reducing reuse by design.
+
+** Runtime hangs or long-running forward batches
+- Set/adjust ~--watchdog-timeout~ and optional soft watchdog.
+- Enable request logging and metrics for phase-level timing visibility.
+
+* File Index (Primary Anchors)
+- ~python/sglang/srt/entrypoints/engine.py~
+- ~python/sglang/srt/managers/tokenizer_manager.py~
+- ~python/sglang/srt/managers/scheduler.py~
+- ~python/sglang/srt/managers/schedule_policy.py~
+- ~python/sglang/srt/mem_cache/radix_cache.py~
+- ~python/sglang/srt/mem_cache/cache_init_params.py~
+- ~python/sglang/srt/managers/cache_controller.py~
+- ~docs/advanced_features/server_arguments.md~
+- ~examples/runtime/README.md~
+
+* Assumptions and Defaults
+- This document is architecture/developer-focused, not end-user quickstart docs.
+- Code paths and options are accurate for repository state as of 2026-02-25.
+- Scope intentionally prioritizes runtime serving internals over exhaustive
+  coverage of every model/kernel implementation file.
+
+* Model Executor Deep Dive (~python/sglang/srt/model_executor/~)
+:PROPERTIES:
+:DATE_ADDED: 2026-03-11
+:END:
+
+** Three-tier pipeline
+#+begin_example
+ScheduleBatch (CPU, Scheduler)
+    ↓
+ModelWorkerBatch (CPU→GPU transition, TpModelWorker)
+    ↓
+ForwardBatch (GPU tensors, ModelRunner)
+    ↓
+GraphRunner (CUDA / Piecewise / CPU)
+#+end_example
+
+** Files and primary responsibilities
+
+| File                                | Primary class(es)                  | Role                                              |
+|-------------------------------------+------------------------------------+---------------------------------------------------|
+| ~forward_batch_info.py~               | ~ForwardBatch~, ~ForwardMode~          | Central GPU tensor container for one forward pass |
+| ~model_runner.py~                     | ~ModelRunner~                        | Orchestrates full inference pipeline              |
+| ~cuda_graph_runner.py~                | ~CudaGraphRunner~                    | Capture+replay CUDA graphs (decode)               |
+| ~piecewise_cuda_graph_runner.py~      | ~PiecewiseCudaGraphRunner~           | Per-token-count torch.compile (prefill)           |
+| ~cpu_graph_runner.py~                 | ~CPUGraphRunner~                     | CPU torch.compile runner                          |
+| ~input_buffers.py~                    | ~GraphInputBuffers~                  | Pre-allocated fixed-size GPU buffers for graphs   |
+| ~model_runner_kv_cache_mixin.py~      | ~ModelRunnerKVCacheMixin~            | KV cache byte-size computation                    |
+| ~forward_batch_deepseek_mha_mixin.py~ | ~ForwardBatchDeepSeekMHAMixin~       | DeepSeek MLA chunked-prefix-cache metadata        |
+| ~hook_manager.py~                     | ~register_forward_hooks~             | fnmatch-pattern nn.Module forward hooks           |
+| ~mindspore_runner.py~                 | ~init_ms_distributed~                | Ascend NPU MindSpore init / HCCL reuse            |
+
+** ForwardBatch key fields (~forward_batch_info.py~)
+~ForwardBatch~ carries all per-forward-pass state.  Tensor shapes use the
+convention:
+- ~[num_tokens]~  — flattened across all sequences in the batch
+- ~[batch_size]~  — one entry per sequence
+
+Core fields:
+- ~forward_mode~: ~EXTEND~ | ~DECODE~ | ~MIXED~ | ~IDLE~ | ~TARGET_VERIFY~ | ~DRAFT_EXTEND~ | ~SPLIT_PREFILL~ | ~DLLM_EXTEND~
+- ~input_ids [num_tokens]~, ~positions [num_tokens]~
+- ~seq_lens [batch_size]~, ~out_cache_loc [num_tokens]~ (KV write pointer)
+- ~req_pool_indices [batch_size]~ (index into req_to_token_pool)
+- ~mrope_positions [3, num_tokens]~ — Qwen-VL multi-head RoPE
+- ~mamba_track_indices / mamba_track_mask~ — Mamba SSM state tracking
+- ~spec_info~ — speculative decoding metadata
+- ~capture_hidden_mode~: ~NULL~ | ~LAST~ | ~FULL~
+- ~global_num_tokens_gpu [dp_size]~ — for DP attention coordination
+- ~pp_proxy_tensors~ — pipeline-parallel hidden state passthrough
+- ~encoder_lens [batch_size]~ — encoder-decoder models
+- ~lora_ids [batch_size]~ — per-sequence LoRA adapter selection
+
+** CudaGraphRunner design (~cuda_graph_runner.py~)
+- Captures one ~torch.cuda.CUDAGraph~ per batch-size bucket (default: 1,2,4,8,16,32,64,128).
+- Reverse capture order enables CUDA memory pool sharing across graphs.
+- ~freeze_gc()~ prevents GC-induced kernel launches during recording.
+- At runtime: ~populate_from_forward_batch()~ → ~graph.replay()~ → extract output buffers.
+- If ~capture_hidden_mode~ differs from captured mode, the graph must be re-recorded.
+- Speculative decoding: ~TARGET_VERIFY~ graphs capture ~num_tokens_per_bs × batch_size~ tokens.
+
+** PiecewiseCudaGraphRunner design (~piecewise_cuda_graph_runner.py~)
+- Uses ~torch.compile~ (inductor/eager backend) per *token-count* bucket, not batch-size.
+- Compiles only ~model.language_model.model~ (embedder stays eager).
+- No actual CUDA graph recording — captures lazy compilation artifacts.
+- Better for variable-length prefill; avoids huge static graphs.
+- Mutual exclusion: cannot coexist with ~--enable-torch-compile~, PP>1, DeepEP/Mooncake MoE.
+
+** CPUGraphRunner design (~cpu_graph_runner.py~)
+- ~torch.compile(dynamic=False)~ enforces static shapes, no CUDA memory management.
+- Must register ~torch.library.register_fake()~ stubs for custom CUDA ops.
+- Only supports ~dp_size=1~, ~pp_size=1~, no TP gather features.
+
+** GraphInputBuffers design (~input_buffers.py~)
+Pre-allocated fixed tensors backing CUDA graphs.  Key design points:
+- ~seq_lens_cpu~ is kept on CPU — some attention kernels branch on it from host.
+- ~num_token_non_padded [1]~ lets kernels skip padded buffer positions.
+- Population at runtime: ~populate_from_forward_batch()~ copies real data into fixed buffers
+  and fills unused slots with fill values.
+- ~global_num_tokens_gpu [dp_size]~ coordinates DP attention token counts.
+
+** Hook system (~hook_manager.py~)
+~register_forward_hooks(model, hook_specs)~ attaches PyTorch ~register_forward_hook~
+via fnmatch patterns, e.g. ~"model.layers.*.mlp"~.  Each spec provides a
+~hook_factory~ callable (loaded by dotted import path) that produces the actual hook.
+
+** KV cache sizing (~model_runner_kv_cache_mixin.py~)
+~get_cell_size_per_token()~ computes bytes/token for pool allocation:
+- MHA: ~num_kv_heads × (head_dim + v_head_dim) × num_layers × dtype_bytes~
+- MLA (DeepSeek): ~(kv_lora_rank + qk_rope_head_dim) × num_layers × dtype_bytes~
+  plus FP4 scale overhead and NSA indexer if applicable.
+- Hybrid SWA: weighted sum of full-attention and sliding-window layers.
+
+Pool types: ~MHATokenToKVPool~, ~MLATokenToKVPool~, ~NSATokenToKVPool~,
+~DoubleSparseTokenToKVPool~, ~HybridLinearKVPool~, ~SWAKVPool~.
+
+** DeepSeek MLA chunked prefix mixin (~forward_batch_deepseek_mha_mixin.py~)
+For long-context DeepSeek MLA, breaks prefix KV cache into 256K-token chunks.
+Per-chunk metadata: ~starts [num_chunks, bs]~, ~seq_lens [num_chunks, bs]~,
+~cu_seq_lens~, ~max_seq_lens~, ~kv_indices~.  Allows attending to arbitrarily
+long prefixes while staying within kernel memory limits.
+
+* Full Request Execution Path Trace
+:PROPERTIES:
+:DATE_ADDED: 2026-03-11
+:END:
+
+** Process topology
+#+begin_example
+HTTP Client
+    ↕ HTTP/SSE (JSON)
+FastAPI  (http_server.py)
+    ↕ async/await (in-process)
+TokenizerManager  (tokenizer_manager.py)
+    ↕ ZMQ PUSH-PULL IPC (pickle)
+Scheduler  (scheduler.py)
+    ↕ ZMQ PUSH-PULL IPC (pickle)
+Detokenizer  (detokenizer_manager.py)
+    ↕ ZMQ PUSH-PULL IPC (pickle)
+TokenizerManager  →  HTTP client (SSE stream)
+#+end_example
+
+Scheduler also drives TP workers (same or separate processes via ZMQ broadcast).
+
+** Stage 1 — HTTP entry (~http_server.py~)
+~POST /generate~ → ~async generate_request(obj: GenerateReqInput)~.
+- For streaming: returns ~StreamingResponse~ (SSE, ~text/event-stream~).
+- For non-streaming: ~await __anext__()~ on the async generator.
+- Serialization: orjson in/out.
+
+** Stage 2 — TokenizerManager (~tokenizer_manager.py~)
+#+begin_src python
+async def generate_request(obj):
+    obj.normalize_batch_and_arguments()
+    tokenized = await self._tokenize_one_request(obj)   # text → token IDs
+    state = self._send_one_request(obj, tokenized)       # push to scheduler via ZMQ
+    self.rid_to_state[obj.rid] = state                   # track per-request state
+    async for response in self._wait_one_response(state):
+        yield response      # streams JSON chunks to HTTP layer
+#+end_src
+State uses an ~asyncio.Event~ to wake the wait loop when detokenizer pushes output.
+
+** Stage 3 — Scheduler event loop (~scheduler.py~)
+#+begin_src python
+def event_loop_normal():
+    while True:
+        recv_reqs = self.recv_requests()           # ZMQ PULL, non-blocking
+        self.process_input_requests(recv_reqs)     # → handle_generate_request()
+        batch = self.get_next_batch_to_run()       # scheduling policy
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+#+end_src
+~handle_generate_request()~: creates ~Req~, checks RadixAttention prefix cache,
+adds to waiting queue.
+~get_next_batch_to_run()~: applies policy, mixes EXTEND+DECODE (continuous batching).
+
+** Stage 4 — Model execution (~tp_worker.py~ + ~model_runner.py~)
+#+begin_src python
+# scheduler.py
+worker_batch = batch.get_model_worker_batch()
+result = self.model_worker.forward_batch_generation(worker_batch)
+#+end_src
+Inside ~model_runner.forward()~:
+1. Check CUDA graph eligibility → ~graph_runner.replay()~  (fast decode path)
+2. Else prefill → ~piecewise_cuda_graph_runner.replay()~ or eager ~model.forward()~
+3. Returns ~ModelRunnerOutput(logits_output, can_run_graph)~
+
+** Stage 5 — Sampling (~model_runner.py~)
+#+begin_src python
+def sample(logits_output, forward_batch):
+    sampling_info.update_regex_vocab_mask()
+    sampling_info.apply_logits_bias(logits_output.next_token_logits)
+    next_token_ids = self.sampler(logits_output, sampling_info, ...)
+    return next_token_ids    # [batch_size]
+#+end_src
+Sampling parameters (temperature, top_p, top_k, grammar masks) are batched tensors —
+each sequence can have distinct values.
+
+** Stage 6 — Output processing (~scheduler_output_processor_mixin.py~)
+- Appends ~next_token_ids~ to ~req.output_ids~.
+- Checks stop conditions (EOS, max_tokens, stop strings).
+- Sends ~BatchTokenIDOutput~ to detokenizer via ZMQ PUSH.
+
+** Stage 7 — Detokenizer (~detokenizer_manager.py~)
+- Receives ~BatchTokenIDOutput~ (token IDs).
+- Incrementally decodes only new tokens (handles UTF-8 surrogate pairs).
+- Sends ~BatchStrOutput~ (decoded text strings) back to tokenizer via ZMQ PUSH.
+
+** Stage 8 — Response to client
+TokenizerManager receives ~BatchStrOutput~, sets ~state.event~, ~_wait_one_response~
+yields the chunk, http_server.py emits SSE frame:
+#+begin_example
+data: {"text": "Hello", "finish_reason": null, "usage": {...}}
+
+data: {"text": " world!", "finish_reason": "stop", "usage": {...}}
+
+data: [DONE]
+#+end_example
+
+** Data structure pipeline
+#+begin_example
+GenerateReqInput            (HTTP JSON → Python)
+  ↓ tokenize
+TokenizedGenerateReqInput   (+ input_ids: List[int])
+  ↓ scheduler creates
+Req                         (internal state, kv cache ptr, output_ids)
+  ↓ batched into
+ScheduleBatch               (many Reqs, ForwardMode)
+  ↓ converted to
+ForwardBatch                (GPU tensors: input_ids, positions, out_cache_loc …)
+  ↓ model produces
+LogitsProcessorOutput       (logits + sampled next_token_ids)
+  ↓ scheduler streams
+BatchTokenIDOutput          (rids + new token IDs)
+  ↓ detokenizer decodes
+BatchStrOutput              (rids + decoded text strings)
+  ↓
+HTTP JSON response
+#+end_example
+
+** IPC summary table
+
+| Direction                  | Protocol       | Serialization | Notes                                |
+|----------------------------+----------------+---------------+--------------------------------------|
+| HTTP Client → FastAPI      | HTTP/REST      | JSON          | orjson                               |
+| FastAPI → TokenizerManager | async/await    | Python obj    | in-process                           |
+| Tokenizer → Scheduler      | ZMQ PUSH-PULL  | pickle        | ~send_pyobj~ / ~recv_pyobj~              |
+| Scheduler → Detokenizer    | ZMQ PUSH-PULL  | pickle        | same IPC channel                     |
+| Detokenizer → Tokenizer    | ZMQ PUSH-PULL  | pickle        | reverse direction on separate socket |
+| Tokenizer → HTTP Client    | HTTP/SSE       | JSON          | streaming, orjson                    |
+
+* ModelRunner Deep Dive (~python/sglang/srt/model_executor/model_runner.py~)
+:PROPERTIES:
+:DATE_ADDED: 2026-03-11
+:LINES: 2576
+:END:
+
+** Class definition
+#+begin_src python
+class ModelRunner(ModelRunnerKVCacheMixin):
+    ...
+#+end_src
+~ModelRunnerKVCacheMixin~ contributes KV pool sizing; ~ModelRunner~ owns everything else.
+
+Output type:
+#+begin_src python
+@dataclass
+class ModelRunnerOutput:
+    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+    can_run_graph: bool
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics]
+#+end_src
+
+** ~__init__~ → ~initialize()~ call chain
+~__init__~ stores args, calls three methods:
+1. ~model_specific_adjustment()~ — override server_args from model type (disable cuda graph for
+   double sparsity, disable chunked prefill for unsupported multimodal models, etc.)
+2. ~init_torch_distributed()~ — NCCL/GLOO/HCCL init, returns ~min_per_gpu_memory~
+3. ~initialize(min_per_gpu_memory)~ — the real constructor (15 ordered steps, see below)
+
+** ~initialize()~ — 15 ordered steps
+#+begin_example
+ 1.  TorchMemorySaverAdapter.create()           CPU weight offload support
+ 2.  remote_instance_init_transfer_engine()     Mooncake RDMA (optional)
+ 3.  set_global_expert_location_metadata()      MoE expert placement init (EPLB)
+ 4.  set_global_expert_distribution_recorder()  EPLB telemetry recorder
+ 5.  EPLBManager(self)                          Expert Parallel Load Balancer
+ 6.  create_sampler()                           token sampler instance
+ 7.  load_model()                               weight loading (slowest step ~here~)
+ 8.  apply_torchao_config_to_model()            post-quantization patching
+ 9.  apply_torch_tp()                           native torch TP (if model supports it)
+10.  init_lora_manager()                        LoRA adapter manager
+11.  configure_kv_cache_dtype()                 fp8/fp4/bf16 KV cache dtype
+12.  init_memory_pool()                         allocate KV cache pools (mixin)
+13.  init_cublas() + init_attention_backend() + kernel_warmup()
+14.  init_device_graphs()                       CudaGraphRunner.capture() — ~CAN TAKE MINUTES~
+15.  init_piecewise_cuda_graphs()               PiecewiseCudaGraphRunner
+#+end_example
+Step 14 is the longest — "This can take up to several minutes" for large models.
+
+** ~load_model()~ (line ~831~)
+#+begin_example
+1. Capability check: sm < 80 → force float16; sm < 75 → raise
+2. Build LoadConfig (format, download_dir, tp_rank, ModelOpt config)
+3. Load weights inside memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS)
+4. FP8 KV cache: load scaling factors, or warn about default=1.0
+5. Detect sliding_window_size from model
+6. reserve_rope_cache_for_long_sequences()  ← must happen BEFORE graph capture
+7. dist.monitored_barrier(timeout=480s)     ← detect straggler TP ranks
+#+end_example
+
+** ~init_attention_backend()~ (line ~1630~)
+Three modes based on server args:
+#+begin_example
+PDMux enabled:
+    attn_backend = _get_attention_backend(init_new_workspace=True)
+    decode_attn_backend_group = [backend × sm_group_num]
+
+Two-batch overlap:
+    attn_backend = TboAttnBackend.init_new(_get_attention_backend)
+
+Normal (default):
+    if decode_backend_str != prefill_backend_str:
+        attn_backend = HybridAttnBackend(decode=..., prefill=...)
+    else:
+        attn_backend = _get_attention_backend_from_str(backend_str)
+#+end_example
+~_get_attention_backend_from_str~ looks up ~ATTENTION_BACKENDS[backend_str](self)~
+then wraps with ~attn_backend_wrapper~.
+
+** ~init_device_graphs()~ (line ~2018~)
+#+begin_src python
+graph_runners = defaultdict(lambda: CudaGraphRunner, {
+    "cpu": CPUGraphRunner,
+    "npu": NPUGraphRunner,
+})
+self.graph_runner = graph_runners[self.device](self)
+#+end_src
+
+Skip conditions (no capture):
+- ~not is_generation~ — embedding models have no decode loop
+- ~model_impl == "mindspore"~
+- ~disable_cuda_graph~ (explicit flag)
+- CPU device without ~enable_torch_compile~
+
+** ~init_piecewise_cuda_graphs()~ (line ~2064~)
+Walks ~language_model.model.layers~ to collect ~attention_layers~ and ~moe_layers~
+(handles many naming conventions: ~self_attn.attn~, ~self_attn.attn_mqa~,
+~layer.attn~, ~layer.linear_attn~, ~layer.attention.attn~).
+
+Skip if ~len(attention_layers) < num_hidden_layers~ (non-standard GQA).
+
+** ~forward()~ — main entry point (line ~2277~)
+#+begin_src python
+def forward(self, forward_batch, ...):
+    self.forward_pass_id += 1
+    with expert_distribution_recorder.with_forward_pass(forward_pass_id, forward_batch):
+        output = self._forward_raw(...)
+        # Elastic EP fault recovery: if rank faults detected, rebalance and retry
+        if elastic_ep_state.is_active_equal_last() is False:
+            eplb_manager.rebalance()
+            output = self._forward_raw(...)
+    experts_capturer.on_forward_end(...)   # MoE routing telemetry
+    eplb_manager.on_forward_pass_end()
+    return output
+#+end_src
+
+** ~_forward_raw()~ — the decision tree (line ~2333~)
+#+begin_example
+1. can_run_graph?
+      forward_mode.is_cuda_graph() AND graph_runner AND graph_runner.can_run(fb)?
+      YES → graph_runner.replay(fb)     ← fast path
+
+2. Prepare distributed sync buffers
+      global_num_tokens_cpu set?  → prepare_mlp_sync_batch()     (DP attention)
+      else                        → prepare_attn_tp_scatter_input()
+
+3. Adjust num_token_non_padded for attn TP rank (if gathered buffer needed)
+
+4. Route by forward_mode:
+      DECODE          → forward_decode()
+      SPLIT_PREFILL   → forward_split_prefill()
+      EXTEND / DRAFT  → forward_extend()
+      IDLE            → forward_idle()
+
+5. Post-forward MLP sync (DP attention, last PP rank only)
+#+end_example
+
+** The four dispatch methods
+
+~forward_decode()~ (line ~2174~):
+- Optionally re-inits pdmux decode backend metadata.
+- Calls ~model.forward(input_ids, positions, forward_batch)~.
+
+~forward_extend()~ (line ~2197~):
+- Checks ~piecewise_cuda_graph_runner.can_run(fb)~ → ~replay()~.
+- Falls back to eager ~model.forward()~.
+- Passes ~input_embeds~ if multimodal, ~get_embedding=True~ if not generation.
+- Returns ~(output, can_run_graph)~.
+
+~forward_idle()~ (line ~2237~):
+- DP attention padded idle batches: reinits attn metadata, then ~model.forward()~.
+
+~forward_split_prefill()~ (line ~2256~):
+- Layer-range based: ~model.forward_split_prefill(…, (start_layer, end_layer))~.
+- Advances ~forward_batch.split_index~ after each call.
+
+** ~sample()~ (line ~2418~)
+#+begin_src python
+def sample(logits_output, forward_batch):
+    # Handle duplex models (multiple output heads)
+    if isinstance(logits_output, tuple):
+        return torch.stack([sample(v, fb) for v in logits_output], axis=-1)
+
+    sampling_info.update_regex_vocab_mask()
+    sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+    next_token_ids = self.sampler(
+        logits_output, sampling_info, return_logprob, top_logprobs_nums,
+        token_ids_logprobs,
+        positions if is_decode else seq_lens - 1,   # last-token index for prefill
+    )
+    return next_token_ids
+#+end_src
+
+** ~compute_logprobs_only()~ (line ~2456~)
+Optimized path for prefill requests that need ~token_ids_logprobs~ but not next-token
+generation.  Calls ~sampler.compute_logprobs_only()~ — skips categorical sampling.
+
+** Weight update methods (RLHF / online training workflows)
+
+| Method                           | Transport          | Use case                          |
+|----------------------------------+--------------------+-----------------------------------|
+| ~update_weights_from_disk()~       | File I/O           | Hot-reload from checkpoint        |
+| ~update_weights_from_distributed()~ | NCCL broadcast    | Training→inference weight sync    |
+| ~update_weights_from_tensor()~     | Shared mem / ZMQ   | In-process or IPC tensor transfer |
+| ~send_weights_to_remote_instance()~ | NCCL broadcast   | Disaggregated serving weight push |
+
+~update_weights_from_distributed~ supports ~flattened_bucket~ format: packs all
+parameters into one flat tensor for a single large broadcast instead of N small ones.
+
+** Key properties and detection logic
+
+| Property              | Detection                                                               |
+|-----------------------+-------------------------------------------------------------------------|
+| ~mambaish_config~       | ~mamba2_config or hybrid_gdn_config or kimi_linear_config~                |
+| ~model_is_mrope~        | ~"mrope_section" in rope_scaling~ (Qwen-VL multi-head RoPE)               |
+| ~max_token_pool_size~   | ~min(swa_max_total_num_tokens, max_total_num_tokens)~ for hybrid SWA      |
+| ~support_pp~            | ~"pp_proxy_tensors" in inspect.signature(model.forward).parameters~       |
+| ~sliding_window_size~   | ~model.get_attention_sliding_window_size()~ or ~model_config~ fields        |
+
+** File index for model_executor
+- ~python/sglang/srt/model_executor/model_runner.py~         (2576 lines)
+- ~python/sglang/srt/model_executor/forward_batch_info.py~
+- ~python/sglang/srt/model_executor/cuda_graph_runner.py~
+- ~python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py~
+- ~python/sglang/srt/model_executor/cpu_graph_runner.py~
+- ~python/sglang/srt/model_executor/input_buffers.py~
+- ~python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py~
+- ~python/sglang/srt/model_executor/forward_batch_deepseek_mha_mixin.py~
+- ~python/sglang/srt/model_executor/hook_manager.py~
+- ~python/sglang/srt/model_executor/mindspore_runner.py~

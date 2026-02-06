@@ -1,0 +1,26 @@
+apiVersion: zephyr-mlsys/v1
+kind: Environment
+metadata:
+  name: hf-datasets
+  description: "HuggingFace datasets in isolated venv (avoids datasets==0.0.9 Spack view collision)"
+spec:
+  image: "${SYGALDRY_SNAPSHOT_IMAGE:-sygaldry/zephyr:spack}"
+  venvs:
+    - name: default
+      packages:
+        - "datasets>=2.0"
+      overrides: []
+  validation:
+    provenance:
+      spack:
+        - numpy
+        - pandas
+      uv:
+        - datasets
+    no_nvidia_pip: true
+    gpu_functional: []
+    hard_fail_on:
+      - abi_mismatch
+      - core_conflict
+    soft_fail_on:
+      - nvidia_dsl_leak

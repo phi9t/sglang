@@ -1,0 +1,729 @@
+
+ ▐▛███▜▌   Claude Code v2.1.58
+▝▜█████▛▘  Sonnet 4.6 · Claude Pro
+  ▘▘ ▝▝    /mnt/data_infra/workspace/sglang
+
+❯ deep dive @python/sglang/srt/model_executor/  
+  ⎿  Listed directory python/sglang/srt/model_executor/
+
+● Recalled 1 memory (ctrl+o to expand)
+
+● Explore(Deep dive model_executor directory)
+  ⎿  Initializing…
+  ⎿  Error: Sibling tool call errored
+
+● Explore(Deep dive model_executor directory)
+  ⎿  Done (28 tool uses · 107.6k tokens · 1m 44s)
+  (ctrl+o to expand)
+
+● Here's a comprehensive breakdown of the model_executor/ architecture:
+
+  ---
+  Architecture Overview
+
+  The model executor is a 3-tier pipeline:
+
+  ScheduleBatch (CPU/Scheduler)
+      ↓
+  ModelWorkerBatch (CPU→GPU, TpModelWorker)
+      ↓
+  ForwardBatch (GPU tensors, ModelRunner)
+      ↓
+  Graph Runner (CUDA/Piecewise/CPU)
+
+  ---
+  Files & Key Classes
+
+  forward_batch_info.py — Central Data Structure
+
+  ForwardBatch is the core GPU tensor container (~300+ fields):
+  - input_ids [num_tokens], positions [num_tokens] — flattened across batch
+  - seq_lens [batch_size], out_cache_loc [num_tokens] — KV cache pointers
+  - forward_mode: EXTEND/DECODE/MIXED/TARGET_VERIFY/DRAFT_EXTEND/IDLE/...
+  - capture_hidden_mode: NULL/LAST/FULL — controls if hidden states are captured
+  - mrope_positions [3, num_tokens] (Qwen-VL), mamba_track_indices (Mamba SSM),
+  spec_info (speculative decoding), pp_proxy_tensors (pipeline parallel)
+
+  Key design: num_tokens = total flattened tokens, batch_size = number of
+  sequences.
+
+  ---
+  model_runner.py — Main Inference Orchestrator (~3000 lines)
+
+  Decides which runner to use:
+  Decode + bs in captured graphs → cuda_graph_runner.replay()
+  Prefill + piecewise enabled   → piecewise_cuda_graph_runner.forward()
+  CPU mode                       → cpu_graph_runner.replay()
+  Else                           → eager model.forward()
+
+  ---
+  cuda_graph_runner.py — CUDA Graph Capture/Replay
+
+  - Captures per batch-size (1,2,4,8,16,32,64,128 by default)
+  - Pre-allocates GraphInputBuffers once; copies real data at runtime
+  - Reverse capture order enables CUDA memory pool sharing
+  - Handles capture_hidden_mode variants (must re-capture if mode changes)
+  - spec_info: For TARGET_VERIFY, captures num_tokens_per_bs × batch_size total
+  tokens
+
+  ---
+  piecewise_cuda_graph_runner.py — Prefill torch.compile
+
+  - Not CUDA graphs — uses torch.compile per token-count bucket ([256, 512, 
+  1024, ...])
+  - Compiles only model.language_model.model (embedder stays eager)
+  - Better for variable-length prefill; avoids huge static graphs
+
+  ---
+  input_buffers.py — Pre-allocated GPU Buffers
+
+  GraphInputBuffers pre-allocates fixed-size tensors for CUDA graphs:
+  - seq_lens_cpu stays on CPU — some attention kernels need CPU access
+  - Runtime populate_from_forward_batch() copies actual data + pads remainder
+  - num_token_non_padded [1] lets kernels skip padding
+
+  ---
+  hook_manager.py — Instrumentation
+
+  Registers nn.Module forward hooks via fnmatch patterns:
+  # Pattern: "model.layers.*.mlp" → all MLPs
+  register_forward_hooks(model, [{"target_modules": ["model.layers.*.mlp"],
+  "hook_factory": "my_mod:make_hook"}])
+
+  ---
+  model_runner_kv_cache_mixin.py — KV Cache Sizing
+
+  Computes bytes/token for:
+  - MHA: num_kv_heads × (head_dim + v_head_dim) × num_layers × dtype_bytes
+  - MLA (DeepSeek): (kv_lora_rank + qk_rope_head_dim) × num_layers × dtype_bytes
+   + FP4 scale + NSA indexer overhead
+  - Hybrid SWA: weighted sum of full vs. sliding-window layers
+
+  ---
+  forward_batch_deepseek_mha_mixin.py — DeepSeek Chunked Prefix Cache
+
+  For long-context DeepSeek MLA: breaks prefix KV cache into 256K-token chunks,
+  computing per-chunk attention metadata (starts, seq_lens, cu_seq_lens,
+  kv_indices) to stay within memory limits.
+
+  ---
+  cpu_graph_runner.py — CPU torch.compile
+
+  Same interface as CudaGraphRunner but:
+  - Uses torch.compile(dynamic=False) instead of torch.cuda.CUDAGraph
+  - Must register torch.library.register_fake() for custom CUDA ops
+  - Only supports dp_size=1, pp_size=1, no TP features
+
+  ---
+  mindspore_runner.py — Ascend NPU Init
+
+  Launches MindSpore scheduler subprocess, sets MS_WORKER_NUM/MS_ROLE env vars,
+  then calls reuse_hccl_comm() to share NCCL communicators between PyTorch and
+  MindSpore.
+
+  ---
+  Key Design Patterns
+
+  ┌────────────────────────┬──────────────────────┬─────────────────────────┐
+  │        Pattern         │        Where         │           Why           │
+  ├────────────────────────┼──────────────────────┼─────────────────────────┤
+  │ Static pre-allocated   │ input_buffers.py     │ CUDA graphs require     │
+  │ buffers                │                      │ fixed tensor addresses  │
+  ├────────────────────────┼──────────────────────┼─────────────────────────┤
+  │ seq_lens_cpu kept on   │ input_buffers.py     │ Some attention kernels  │
+  │ CPU                    │                      │ branch on CPU values    │
+  ├────────────────────────┼──────────────────────┼─────────────────────────┤
+  │ Reverse capture order  │ cuda_graph_runner.py │ Enables CUDA memory     │
+  │                        │                      │ pool sharing            │
+  ├────────────────────────┼──────────────────────┼─────────────────────────┤
+  │                        │                      │ Avoids monolithic class │
+  │ ForwardBatch mixins    │ *_mixin.py files     │  for model-specific     │
+  │                        │                      │ fields                  │
+  ├────────────────────────┼──────────────────────┼─────────────────────────┤
+  │ num_token_non_padded   │ input_buffers.py     │ Skip padding overhead   │
+  │                        │                      │ in kernels              │
+  ├────────────────────────┼──────────────────────┼─────────────────────────┤
+  │ capture_hidden_mode    │                      │ Speculative decoding    │
+  │ variants               │ cuda_graph_runner.py │ needs full hidden       │
+  │                        │                      │ states                  │
+  └────────────────────────┴──────────────────────┴─────────────────────────┘
+
+✻ Churned for 2m 36s
+
+❯ trace the entire execution path of a single request  
+
+● Explore(Trace full request execution path)
+  ⎿  Done (43 tool uses · 108.6k tokens · 1m 46s)
+  (ctrl+o to expand)
+
+● Here's the complete execution path for a single request:
+
+  ---
+  Full Request Execution Path
+
+  Process Topology
+
+  SGLang runs as 4+ separate processes communicating via ZMQ:
+
+  HTTP Client
+      ↕ HTTP/SSE
+  FastAPI (http_server.py)
+      ↕ async/await (in-process)
+  TokenizerManager (tokenizer_manager.py)
+      ↕ ZMQ PUSH-PULL (IPC socket, pickle)
+  Scheduler (scheduler.py)
+      ↕ ZMQ PUSH-PULL (IPC socket, pickle)
+  Detokenizer (detokenizer_manager.py)
+      ↕ ZMQ PUSH-PULL (IPC socket, pickle)
+  TokenizerManager (back to client)
+
+  The Scheduler also drives TP workers directly (same or separate processes via
+  ZMQ broadcast).
+
+  ---
+  Stage-by-Stage Trace
+
+  1. HTTP Entry — http_server.py
+
+  POST /generate
+    → async generate_request(obj: GenerateReqInput, request: Request)
+    → tokenizer_manager.generate_request(obj, request)  # async generator
+    → For streaming: StreamingResponse(SSE), for non-streaming: __anext__()
+
+  Data structure: GenerateReqInput (prompt text + sampling params + rid)
+
+  ---
+  2. TokenizerManager — tokenizer_manager.py
+
+  async def generate_request(obj):
+      obj.normalize_batch_and_arguments()
+      tokenized = await self._tokenize_one_request(obj)   # text → token IDs
+      state = self._send_one_request(obj, tokenized)       # sends to scheduler 
+  via ZMQ
+      self.rid_to_state[obj.rid] = state                   # track for response 
+  routing
+
+      async for response in self._wait_one_response(state):
+          yield response   # streams back to HTTP client via asyncio.Event
+
+  Data transformation: GenerateReqInput → TokenizedGenerateReqInput (adds
+  input_ids)
+
+  ZMQ: self.send_to_scheduler.send_pyobj(tokenized_obj) (PUSH socket)
+
+  ---
+  3. Scheduler Event Loop — scheduler.py
+
+  def event_loop_normal():
+      while True:
+          recv_reqs = self.recv_requests()           # ZMQ PULL, non-blocking 
+  poll
+          self.process_input_requests(recv_reqs)     # → 
+  handle_generate_request()
+          batch = self.get_next_batch_to_run()       # scheduling policy
+          if batch:
+              result = self.run_batch(batch)         # → model execution
+              self.process_batch_result(batch, result)
+
+  handle_generate_request(): Creates Req object, adds to waiting_queue. Checks
+  prefix cache (RadixAttention): if prefix hit, reuses KV cache pages.
+
+  get_next_batch_to_run(): Applies scheduling policy — mixes EXTEND (prefill) +
+  DECODE (generation) requests into a single ScheduleBatch (continuous
+  batching).
+
+  ---
+  4. Model Execution — tp_worker.py + model_runner.py
+
+  # scheduler.py
+  worker_batch = batch.get_model_worker_batch()
+  result = self.model_worker.forward_batch_generation(worker_batch)
+
+  # model_runner.py
+  def forward(forward_batch: ForwardBatch):
+      if cuda_graph_runner.can_run(forward_batch):
+          return cuda_graph_runner.replay(forward_batch)   # decode: fast path
+      elif piecewise_enabled and is_extend:
+          return piecewise_cuda_graph_runner.forward(...)  # prefill: compiled
+      else:
+          return eager_forward(forward_batch)              # fallback
+
+  Inside cuda_graph_runner.replay():
+  1. buffers.populate_from_forward_batch()   # copy actual data → pre-allocated
+  buffers
+  2. cuda_graph.replay()                     # replay captured CUDA ops
+  3. extract output_buffers[batch_size]      # get logits [batch_size,
+  vocab_size]
+
+  Returns: GenerationBatchResult with logits_output and next_token_ids
+
+  ---
+  5. Sampling — inside model_runner.py / sampler
+
+  logits [batch_size, vocab_size]
+    → temperature scaling (logits / temperature)
+    → top-k filter (keep top k tokens)
+    → top-p filter (nucleus sampling)
+    → grammar mask (if structured output enabled)
+    → categorical sample or argmax (greedy)
+    → next_token_ids [batch_size]
+
+  Sampling params are batched tensors (different temp/top_p per request).
+
+  ---
+  6. Output Processing — scheduler_output_processor_mixin.py
+
+  def process_batch_result_decode(batch, result):
+      for req, token_id in zip(batch.reqs, result.next_token_ids):
+          req.output_ids.append(token_id)
+          check_stop_conditions(req)   # EOS, max_tokens, stop strings
+
+  def stream_output(reqs):
+      # Collect reqs that need streaming this step
+      batch_token_output = BatchTokenIDOutput(
+          rids=[...], decode_ids=[new_token_ids], finished_reasons=[...]
+      )
+      self.send_to_tokenizer.send_output(batch_token_output)   # ZMQ PUSH
+
+  ---
+  7. Detokenizer — detokenizer_manager.py
+
+  def event_loop():
+      recv_obj = self.recv_from_scheduler.recv_pyobj()   # ZMQ PULL
+      # handle_batch_token_id_out():
+      for i, rid in enumerate(recv_obj.rids):
+          s = self.decode_status[rid]           # incremental decode state
+          s.decode_ids.extend(new_token_ids)    # append new tokens
+          new_text = tokenizer.decode(          # token IDs → text (incremental)
+              s.decode_ids[s.read_offset:]
+          )
+          s.decoded_text += new_text
+
+      self.send_to_tokenizer.send_pyobj(BatchStrOutput(...))  # ZMQ PUSH
+
+  Key: Incremental decoding — only decodes new tokens, handles UTF-8 surrogate
+  pairs correctly.
+
+  ---
+  8. Response Back to Client — tokenizer_manager.py
+
+  # Background recv loop receives BatchStrOutput, updates state:
+  state.out_list.append(output)
+  state.event.set()   # wake up waiting _wait_one_response()
+
+  # _wait_one_response() awakens:
+  async for response in _wait_one_response(state):
+      yield response   # → http_server.py generator → SSE chunk to client
+
+  SSE stream format:
+  data: {"text": "Hello", "finish_reason": null, "usage": {...}}
+
+  data: {"text": " world!", "finish_reason": "stop", "usage": {...}}
+
+  data: [DONE]
+
+  ---
+  Data Structure Pipeline
+
+  GenerateReqInput           (HTTP JSON → Python)
+    ↓ tokenize
+  TokenizedGenerateReqInput  (+ input_ids: List[int])
+    ↓ scheduler creates
+  Req                        (internal state: output_ids, kv cache ptr, etc.)
+    ↓ batched into
+  ScheduleBatch              (many Reqs, ForwardMode)
+    ↓ converted to
+  ForwardBatch               (GPU tensors: input_ids, positions,
+  out_cache_loc...)
+    ↓ model produces
+  LogitsProcessorOutput      (logits + sampled next_token_ids)
+    ↓ scheduler streams
+  BatchTokenIDOutput         (rids + new token IDs)
+    ↓ detokenizer decodes
+  BatchStrOutput             (rids + decoded text strings)
+    ↓ HTTP response
+  {"text": "...", "finish_reason": "stop", "usage": {...}}
+
+  ---
+  Key Architectural Decisions
+
+  ┌──────────────────────────────┬──────────────────────────────────────────┐
+  │           Decision           │                Rationale                 │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ 4 separate processes (HTTP,  │ CPU tokenization/detokenization doesn't  │
+  │ Tokenizer, Scheduler,        │ block GPU scheduling                     │
+  │ Detokenizer)                 │                                          │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ ZMQ PUSH-PULL for IPC        │ Non-blocking, low-latency, handles       │
+  │                              │ backpressure                             │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ asyncio.Event for response   │ Efficient async wait without polling     │
+  │ routing                      │                                          │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Incremental detokenization   │ Avoid re-decoding entire sequence each   │
+  │                              │ step                                     │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Continuous batching          │ Mixes prefill+decode in same forward     │
+  │                              │ pass for GPU utilization                 │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ CUDA graph replay for decode │ ~0 CPU overhead for the steady-state     │
+  │                              │ decode loop                              │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ rid_to_state dict in         │ Routes responses from shared batch       │
+  │ TokenizerManager             │ output back to individual HTTP requests  │
+  └──────────────────────────────┴──────────────────────────────────────────┘
+
+✻ Cooked for 3m 38s
+
+❯ deep dive model_runner.py 
+
+● Read 1 file (ctrl+o to expand)
+
+● Here's the comprehensive deep dive into model_runner.py (2576 lines):
+
+  ---
+  ModelRunner Deep Dive
+
+  Class Hierarchy
+
+  ModelRunnerKVCacheMixin   (KV cache size computation)
+      └── ModelRunner       (main class)
+
+  Output dataclass (line 265):
+  @dataclass
+  class ModelRunnerOutput:
+      logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+      can_run_graph: bool                              # was CUDA graph used?
+      expert_distribution_metrics: Optional[...]       # EPLB monitoring
+
+  ---
+  __init__ → initialize() Sequence
+
+  __init__ (:272) does very little itself — just stores args, then calls:
+
+  model_specific_adjustment()   # override server_args based on model type
+  init_torch_distributed()      # NCCL/GLOO init, returns min_per_gpu_memory
+  initialize(min_per_gpu_memory)
+
+  initialize() (:432) is the real constructor — 15 ordered steps:
+
+  1.  TorchMemorySaverAdapter.create()          # CPU weight offload support
+  2.  remote_instance_init_transfer_engine()    # Mooncake RDMA (optional)
+  3.  set_global_expert_location_metadata()     # MoE expert placement (EPLB)
+  4.  set_global_expert_distribution_recorder() # EPLB telemetry
+  5.  EPLBManager(self)                         # Expert Parallel Load Balancer
+  6.  create_sampler()                          # token sampler
+  7.  load_model()                              # weight loading
+  8.  apply_torchao_config_to_model()           # quantization post-processing
+  9.  apply_torch_tp()                          # native torch TP (if supported)
+  10. init_lora_manager()                       # LoRA adapter manager
+  11. configure_kv_cache_dtype()               # fp8/fp4/bf16 KV cache
+  12. init_memory_pool()                        # allocate KV cache pools
+  (mixin)
+  13. init_cublas() + init_attention_backend() + kernel_warmup()
+  14. init_device_graphs()                      # CUDA/CPU/NPU graph capture
+  15. init_piecewise_cuda_graphs()              # piecewise torch.compile
+
+  ---
+  load_model() (:831)
+
+  def load_model():
+      # 1. Capability check: sm < 80 → force float16, sm < 75 → raise
+      if torch.cuda.get_device_capability()[0] < 8:
+          server_args.dtype = "float16"
+
+      # 2. Build LoadConfig (format, download_dir, tp_rank, modelopt config)
+      self.load_config = LoadConfig(load_format=..., tp_rank=self.tp_rank, ...)
+
+      # 3. Load weights inside memory region (for CPU offload tracking)
+      with memory_saver_adapter.region(GPU_MEMORY_TYPE_WEIGHTS):
+          self.model = get_model_loader(load_config,
+  model_config).load_model(...)
+
+      # 4. FP8 KV cache: load scaling factors or warn about default=1.0
+      if kv_cache_dtype == "fp8_e4m3":
+          model.load_kv_cache_scales(quantization_param_path)
+
+      # 5. Detect sliding_window_size from model
+      self.sliding_window_size = model.get_attention_sliding_window_size()
+
+      # 6. Pre-expand RoPE cache for long sequences (before graph capture!)
+      reserve_rope_cache_for_long_sequences(model, server_args, model_config)
+
+      # 7. Barrier: detect straggler ranks (480s timeout)
+      dist.monitored_barrier(group=tp_group.cpu_group, timeout=480s)
+
+  Critical ordering: RoPE cache expansion must happen before CUDA graph capture
+  (step 14), otherwise the graph would record wrong RoPE offsets.
+
+  ---
+  init_attention_backend() (:1630)
+
+  Three modes:
+
+  # 1. PDMux: one prefill backend + N decode backends (one per SM group)
+  if enable_pdmux:
+      self.attn_backend = _get_attention_backend(init_new_workspace=True)
+      self.decode_attn_backend_group = [
+          _get_attention_backend() for _ in range(sm_group_num)
+      ]
+
+  # 2. Two-batch overlap: TboAttnBackend wrapper
+  elif enable_two_batch_overlap:
+      self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
+
+  # 3. Normal: single backend (or hybrid if decode != prefill backends)
+  else:
+      if decode_backend_str != prefill_backend_str:
+          self.attn_backend = HybridAttnBackend(decode=..., prefill=...)
+      else:
+          self.attn_backend = _get_attention_backend_from_str(backend_str)
+
+  _get_attention_backend_from_str (:1701) looks up
+  ATTENTION_BACKENDS[backend_str](self) then wraps with attn_backend_wrapper.
+
+  ---
+  init_device_graphs() (:2018)
+
+  graph_runners = {
+      "cpu": CPUGraphRunner,
+      "npu": NPUGraphRunner,
+      default: CudaGraphRunner,    # cuda, musa
+  }
+  self.graph_runner = graph_runners[device](self)
+
+  Skip conditions (no graph capture):
+  - not is_generation — embedding models don't do decode loops
+  - model_impl == "mindspore" — MindSpore has its own runner
+  - device != "cpu" and disable_cuda_graph — explicitly disabled
+  - device == "cpu" and not enable_torch_compile — CPU needs torch.compile
+
+  ---
+  init_piecewise_cuda_graphs() (:2064)
+
+  Walks the model layers to collect attention_layers and moe_layers:
+
+  for layer in language_model.model.layers:
+      # Handles: self_attn.attn, self_attn.attn_mqa (DeepSeek),
+      #          layer.attn (hybrid), layer.linear_attn, layer.attention.attn 
+  (InternVL)
+      self.attention_layers.append(...)
+
+      # Handles: layer.mlp.experts, layer.block_sparse_moe.experts, 
+  layer.moe.experts
+      self.moe_layers.append(moe_block)
+
+  # Gate: if any layer lacks a standard attention block, skip
+  if len(attention_layers) < num_hidden_layers:
+      return  # "Disable piecewise CUDA graph: Non-Standard GQA"
+
+  self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+
+  Skip conditions:
+  - is_draft_worker — draft model always eager
+  - enable_torch_compile — conflicts with piecewise compilation
+  - pp_size > 1 — PP not supported
+  - deepep or mooncake MoE backend — compilation errors
+
+  ---
+  forward() — Main Entry Point (:2277)
+
+  def forward(self, forward_batch, skip_attn_backend_init, pp_proxy_tensors, 
+  ...):
+      self.forward_pass_id += 1
+
+      # 1. Expert distribution recording (for EPLB monitoring)
+      with expert_distribution_recorder.with_forward_pass(forward_pass_id,
+  forward_batch):
+          output = self._forward_raw(...)
+
+          # 2. Elastic EP fault recovery
+          if elastic_ep_state.is_active_equal_last() is False:
+              eplb_manager.rebalance()        # redistribute experts after rank 
+  fault
+              output = self._forward_raw(...) # retry
+
+      # 3. Routed experts capturer (MoE expert routing telemetry)
+      experts_capturer.on_forward_end(forward_batch, can_run_graph,
+  cuda_graph_batch)
+
+      # 4. EPLB end-of-pass hook
+      eplb_manager.on_forward_pass_end()
+
+      return output
+
+  ---
+  _forward_raw() — The Decision Tree (:2333)
+
+  def _forward_raw(self, forward_batch, ...):
+      # Step 1: Can we replay a CUDA/CPU graph?
+      can_run_graph = (
+          forward_batch.forward_mode.is_cuda_graph()   # decode or target_verify
+          and self.graph_runner
+          and self.graph_runner.can_run(forward_batch)  # batch_size captured?
+      )
+      if can_run_graph:
+          ret = self.graph_runner.replay(forward_batch, ...)
+          return ModelRunnerOutput(ret, can_run_graph=True)
+
+      # Step 2: Prepare distributed sync buffers
+      if forward_batch.global_num_tokens_cpu is not None:
+          forward_batch.prepare_mlp_sync_batch(self)    # DP attention path
+      else:
+          forward_batch.prepare_attn_tp_scatter_input(self)  # TP attention path
+
+      # Step 3: Normalize num_token_non_padded for attn TP rank
+      if need_gathered_buffer and not nsa_prefill_cp:
+          forward_batch.adjust_num_token_non_padded_for_attn_tp(...)
+
+      # Step 4: Route by forward_mode
+      if   forward_mode.is_decode():        ret = forward_decode(...)
+      elif forward_mode.is_split_prefill(): ret = forward_split_prefill(...)
+      elif forward_mode.is_extend(...):     ret, can_run_graph =
+  forward_extend(...)
+      elif forward_mode.is_idle():          ret = forward_idle(...)
+      else: raise ValueError(...)
+
+      # Step 5: Post-forward MLP sync (DP attention, last PP rank only)
+      if global_num_tokens_cpu is not None and pp_group.is_last_rank:
+          forward_batch.post_forward_mlp_sync_batch(ret)
+
+      return ModelRunnerOutput(ret, can_run_graph)
+
+  ---
+  The Four Forward Methods
+
+  forward_decode() (:2174) — CUDA graph fallthrough
+
+  def forward_decode(forward_batch, skip_attn_backend_init, pp_proxy_tensors):
+      if not skip_attn_backend_init:
+          if enable_pdmux:
+              self.decode_attn_backend.init_forward_metadata(forward_batch)
+              forward_batch.attn_backend = self.decode_attn_backend
+          else:
+              self.attn_backend.init_forward_metadata(forward_batch)
+
+      return model.forward(input_ids, positions, forward_batch,
+  pp_proxy_tensors=...)
+
+  forward_extend() (:2197) — Prefill path
+
+  def forward_extend(forward_batch, ...):
+      can_run_graph = (piecewise_runner and
+  piecewise_runner.can_run(forward_batch))
+
+      if can_run_graph:
+          return piecewise_runner.replay(forward_batch), True
+
+      if not skip_attn_backend_init:
+          attn_backend.init_forward_metadata(forward_batch)
+
+      return model.forward(input_ids, positions, forward_batch, ...), False
+
+  Handles multimodal: passes input_embeds if forward_batch.input_embeds is not 
+  None.
+
+  forward_idle() (:2237) — DP padding
+
+  Reinits attn metadata if batch_size > 0 (padded idle batch for MLP sync), then
+   model.forward().
+
+  forward_split_prefill() (:2256) — Layer-by-layer
+
+  def forward_split_prefill(forward_batch, forward_count):
+      if split_index == 0 or reinit_attn_backend:
+          attn_backend.init_forward_metadata(forward_batch)
+
+      next_split = min(split_index + forward_count, num_hidden_layers)
+      ret = model.forward_split_prefill(input_ids, positions, forward_batch,
+                                        layer_range=(split_index, next_split))
+      forward_batch.split_index = next_split
+      return ret
+
+  ---
+  sample() (:2418)
+
+  def sample(logits_output, forward_batch):
+      # Handle duplex models (tuple of logits for multiple output streams)
+      if isinstance(logits_output, tuple):
+          return torch.stack([sample(v, fb) for v in logits_output], axis=-1)
+
+      # 1. Apply logits bias + regex/grammar vocab masks
+      sampling_info.update_regex_vocab_mask()
+      sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+      # 2. Sample
+      next_token_ids = self.sampler(
+          logits_output,
+          forward_batch.sampling_info,
+          return_logprob,
+          top_logprobs_nums,
+          token_ids_logprobs,
+          # Position selection: decode→positions, prefill→seq_lens-1 (last 
+  token)
+          positions if is_decode else seq_lens - 1,
+      )
+      return next_token_ids
+
+  ---
+  Weight Update Methods (RLHF Workflows)
+
+  Four distinct update paths:
+
+  ┌────────────────────────────────────┬─────────────┬─────────────────────┐
+  │               Method               │  Transport  │      Use Case       │
+  ├────────────────────────────────────┼─────────────┼─────────────────────┤
+  │ update_weights_from_disk() (:1047) │ File I/O    │ Hot-reload from     │
+  │                                    │             │ checkpoint          │
+  ├────────────────────────────────────┼─────────────┼─────────────────────┤
+  │ update_weights_from_distributed()  │ NCCL        │ Training→inference  │
+  │ (:1269)                            │ broadcast   │ sync                │
+  ├────────────────────────────────────┼─────────────┼─────────────────────┤
+  │ update_weights_from_tensor()       │ Shared      │                     │
+  │ (:1359)                            │ memory /    │ In-process or IPC   │
+  │                                    │ ZMQ         │                     │
+  ├────────────────────────────────────┼─────────────┼─────────────────────┤
+  │ send_weights_to_remote_instance()  │ NCCL        │ Disaggregated       │
+  │ (:1164)                            │ broadcast   │ serving             │
+  └────────────────────────────────────┴─────────────┴─────────────────────┘
+
+  update_weights_from_distributed supports flattened_bucket format — packs all
+  parameter tensors into a single flat tensor for a single large broadcast
+  instead of N small ones.
+
+  ---
+  Properties / Configuration Detection
+
+  # Detected at init time from model configs
+  mambaish_config → mamba2_config or hybrid_gdn_config or kimi_linear_config
+  model_is_mrope  → "mrope_section" in rope_scaling (Qwen-VL, multi-head RoPE)
+  max_token_pool_size → min(swa_max_total_num_tokens, max_total_num_tokens)
+
+  # Dynamic (per forward call)
+  forward_pass_id  # incremented every forward(), used by EPLB recorder
+
+  ---
+  Initialization Order Summary
+
+  __init__
+    ├── model_specific_adjustment()    # disable cuda graph for double sparsity,
+   etc.
+    ├── init_torch_distributed()       # NCCL, TP/PP groups
+    └── initialize()
+          ├── load_model()             # weights, dtype, RoPE cache, sliding
+  window
+          ├── configure_kv_cache_dtype()
+          ├── init_memory_pool()       # KV pools sized by
+  get_cell_size_per_token()
+          ├── init_cublas()            # 16×16 dummy matmul to warm cublas
+          ├── init_attention_backend() # flashinfer/fa3/triton/...
+          ├── kernel_warmup()          # flashinfer autotune (sm90+, MoE only)
+          ├── init_device_graphs()     # CudaGraphRunner.capture() — slowest
+  step
+          └── init_piecewise_cuda_graphs()  # PiecewiseCudaGraphRunner
+
+  The slowest step is init_device_graphs() — capturing O(20) CUDA graphs can
+  take several minutes for large models, which is why it logs "This can take up
+  to several minutes."
+
+✻ Churned for 2m 10s

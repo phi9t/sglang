@@ -9,11 +9,11 @@ It generates:
 - *_pb2.pyi (type hints for mypy/IDEs)
 
 Usage:
-    python compile_proto.py [--check] [--proto-file PROTO_FILE]
+    python compile_proto.py [--check] [--proto-file PROTO_FILE ...]
 
 Options:
     --check         Check if regeneration is needed (exit 1 if needed)
-    --proto-file    Specify proto file (default: sglang_scheduler.proto)
+    --proto-file    Specify proto file(s). If omitted, compiles all default protos.
 
 ### Install Dependencies
 pip install "grpcio==1.75.1" "grpcio-tools==1.75.1"
@@ -34,6 +34,7 @@ from importlib.metadata import version
 from pathlib import Path
 
 GRPC_VERSION = "1.75.1"
+DEFAULT_PROTO_FILES = ["sglang_scheduler.proto", "sglang_execution_worker.proto"]
 
 
 def get_file_mtime(path: Path) -> float:
@@ -174,6 +175,21 @@ def add_generation_header(output_dir: Path, proto_stem: str) -> None:
                 file_path.write_text(header + content)
 
 
+def resolve_proto_files(
+    proto_files: list[str] | None, canonical_proto_dir: Path
+) -> list[Path]:
+    if not proto_files:
+        proto_files = list(DEFAULT_PROTO_FILES)
+
+    resolved = []
+    for proto_file in proto_files:
+        p = Path(proto_file)
+        if not p.is_absolute() and "/" not in proto_file:
+            p = canonical_proto_dir / proto_file
+        resolved.append(p)
+    return resolved
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -191,8 +207,12 @@ def main():
     parser.add_argument(
         "--proto-file",
         type=str,
-        default="sglang_scheduler.proto",
-        help="Proto file to compile (default: sglang_scheduler.proto)",
+        action="append",
+        default=None,
+        help=(
+            "Proto file to compile. "
+            "Can be repeated. Default compiles all canonical protos."
+        ),
     )
 
     parser.add_argument(
@@ -214,12 +234,18 @@ def main():
 
     # Get paths
     script_dir = Path(__file__).parent
-    proto_file = script_dir / args.proto_file
     output_dir = script_dir
+    repo_root = script_dir.parents[3]
+    canonical_proto_dir = repo_root / "proto" / "sglang"
+    proto_files = resolve_proto_files(args.proto_file, canonical_proto_dir)
 
     # Check mode
     if args.check:
-        if check_regeneration_needed(proto_file, output_dir):
+        needs_regen = any(
+            check_regeneration_needed(proto_file, output_dir)
+            for proto_file in proto_files
+        )
+        if needs_regen:
             if verbose:
                 print("Proto files need regeneration")
             sys.exit(1)
@@ -229,19 +255,21 @@ def main():
             sys.exit(0)
 
     # Compile mode
-    success = compile_proto(proto_file, output_dir, verbose)
+    success = True
+    for proto_file in proto_files:
+        this_ok = compile_proto(proto_file, output_dir, verbose)
+        success = success and this_ok
+        if this_ok:
+            add_generation_header(output_dir, proto_file.stem)
 
-    if success:
-        # Add generation headers
-        add_generation_header(output_dir, proto_file.stem)
-
-        if verbose:
-            print("\n✅ Protobuf compilation successful!")
-            print("Generated files are ready for use")
-    else:
+    if not success:
         if verbose:
             print("\n❌ Protobuf compilation failed!")
         sys.exit(1)
+
+    if verbose:
+        print("\n✅ Protobuf compilation successful!")
+        print("Generated files are ready for use")
 
 
 if __name__ == "__main__":

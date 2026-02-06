@@ -1,0 +1,32 @@
+services:
+  sglang:
+    image: lmsysorg/sglang:latest
+    container_name: sglang-qwen3
+    volumes:
+      - /mnt/data_infra/huggingface:/root/.cache/huggingface
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    entrypoint: python3 -m sglang.launch_server
+    command: >
+      --model-path Qwen/Qwen3-0.6B
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

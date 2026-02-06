@@ -75,16 +75,16 @@ url = "2.5.4"
 validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 anyhow = "1.0"
-reasoning-parser = "1.0.0"
-openai-protocol = { version = "1.0.0", features = ["axum"] }
-tool-parser = "1.0.0"
-llm-tokenizer = "1.0.0"
-smg-auth = "1.0.0"
-wfaas = "1.0.0"
-data-connector = "1.0.0"
-smg-mcp = "1.0.0"
-smg-wasm = "1.0.0"
-smg-mesh = "1.0.0"
+reasoning-parser = "=1.0.0"
+openai-protocol = { version = "=1.0.0", features = ["axum"] }
+tool-parser = "=1.0.0"
+llm-tokenizer = "=1.0.0"
+smg-auth = "=1.0.0"
+wfaas = "=1.0.0"
+data-connector = "=1.0.0"
+smg-mcp = "=1.0.0"
+smg-wasm = "=1.0.0"
+smg-mesh = "=1.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 openssl = "0.10.73"
