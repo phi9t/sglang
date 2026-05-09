@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  sglang-gptoss-120b:
+    image: ${IMAGE:-lmsysorg/sglang:latest}
+    container_name: ${CONTAINER_NAME:-sglang-gptoss-120b-test}
+    shm_size: 64g
+    ports:
+      - "${HOST_PORT:-30000}:30000"
+    volumes:
+      - "${HF_CACHE_DIR:-$HOME/sglang-hf-cache}:/data/hf-cache"
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /data/hf-cache
+      HUGGINGFACE_HUB_CACHE: /data/hf-cache
+      FLASHINFER_WORKSPACE_DIR: /tmp/flashinfer
+      HOME: /tmp/home
+    ipc: host
+    user: "${SGLANG_UID}:${SGLANG_GID}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: python3 -m sglang.launch_server
+    command:
+      - --model-path
+      - ${MODEL_PATH:-openai/gpt-oss-120b}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      - --tp
+      - "${TP:-1}"
+      - --tool-server
+      - demo
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]

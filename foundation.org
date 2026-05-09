@@ -1,0 +1,426 @@
+* SGLang Foundation
+
+This document describes:
+
+- The high-level architecture of SGLang.
+- How SGLang is containerized for production-like serving.
+- A concrete example of launching and evaluating the =openai/gpt-oss-120b= model,
+  including GSM8k evaluation, with SGLang running strictly inside Docker.
+
+** Scope and Assumptions
+
+- Audience: engineers familiar with LLM serving, Docker, and basic GPU concepts.
+- Assumes access to:
+  - A multi-GPU machine (e.g., 8× B200) with NVIDIA drivers and =nvidia-container-toolkit=.
+  - Docker images from =lmsysorg/sglang=.
+- Constraint: SGLang (server and evaluation) must run *only* inside containers.
+  Host Python must not be modified.
+
+* SGLang Architecture Overview
+
+SGLang is organized into several major layers and components:
+
+** Frontend / Lang Layer
+
+- Code: =python/sglang/lang=
+- Responsibilities:
+  - Defines the high-level SGLang DSL and function decorators.
+  - Represents prompts and control flow as SGLang programs.
+  - Provides backend abstraction (local engine, remote runtime endpoint).
+- Key pieces:
+  - =python/sglang/lang/api.py=: public API and =set_default_backend=.
+  - =python/sglang/lang/interpreter.py=: executes SGLang programs, manages
+    streaming and state.
+  - =python/sglang/lang/choices.py=: choice / sampling abstractions.
+
+** Runtime / SRT Backend
+
+- Code: =python/sglang/srt=
+- Responsibilities:
+  - Core serving runtime: model loading, batching, scheduling.
+  - Integration with attention kernels, tokenization, sampling, and
+    distributed execution.
+- Key submodules:
+  - =python/sglang/srt/model_executor/=: model execution core.
+  - =python/sglang/srt/tokenizer/=: tokenization and detokenization.
+  - =python/sglang/srt/sampling/=: sampling backends and strategies.
+  - =python/sglang/srt/entrypoints/=: HTTP/OpenAI-style server entrypoints.
+  - =python/sglang/srt/observability/=: metrics, tracing, logging.
+
+** Kernels and JIT / AOT Integrations
+
+- Code:
+  - =python/sglang/jit_kernel/=
+  - =sgl-kernel/=
+- Responsibilities:
+  - Performance-critical CUDA (or other backends) kernels for attention,
+    sampling, quantization, MoE, etc.
+  - Integration with FlashInfer, Triton-based kernels, and vendor-specific
+    implementations.
+
+** High-Level Request Flow
+
+1. Client sends an OpenAI-style request (e.g., =/v1/responses=) to the SGLang
+   server.
+2. HTTP entrypoint parses request and constructs internal SRT request objects.
+3. SRT runtime batches and schedules tokens across requests and GPUs.
+4. Kernels (FlashInfer / sgl-kernel, etc.) execute attention, MLP, sampling.
+5. Runtime assembles tokens into text and returns a JSON response to the client.
+
+* Containerization and Deployment Model
+
+SGLang is shipped as Docker images on Docker Hub:
+
+- =lmsysorg/sglang:latest=
+- =lmsysorg/sglang:latest-runtime=
+- Built from =docker/=. The =latest-runtime= variant is slimmer (no build
+  toolchain) and preferred for production.
+
+This section describes a container setup used for running =openai/gpt-oss-120b=
+with strong separation from host Python.
+
+** Container Runtime Settings
+
+We use a container that:
+
+- Has GPU access:
+  - =--gpus all=
+  - =--ipc=host=
+  - =--shm-size 64g=
+- Runs as the *host user*:
+  - =--user $(id -u):$(id -g)=
+- Mirrors host user identity for tools that look up =/etc/passwd= and
+  =/etc/group=:
+  - =-v /etc/passwd:/etc/passwd:ro=
+  - =-v /etc/group:/etc/group:ro=
+- Uses a dedicated host HF cache directory:
+  - Host: =~/sglang-hf-cache=
+  - Container: =/data/hf-cache=
+- Directs FlashInfer and other tools to write into container-local temp dirs,
+  not host-mounted system paths.
+
+** HF Cache Mount and Environment
+
+We mount a dedicated HF cache (owned by the host user) into the container:
+
+- Host:
+
+  - Directory: =~/sglang-hf-cache=
+  - Ownership: same UID/GID as the user running Docker.
+
+- Container mount:
+
+  - =-v "$HOME/sglang-hf-cache:/data/hf-cache"=
+
+- Environment inside the container:
+
+  - =HF_HOME=/data/hf-cache=
+  - =HUGGINGFACE_HUB_CACHE=/data/hf-cache=
+
+This keeps model weights cached on the host, reusable across container runs,
+without touching host system Python or root-owned cache directories.
+
+** FlashInfer Workspace and HOME
+
+FlashInfer JIT and some tools create temporary files in a workspace directory.
+To avoid permission issues with host paths like =/data02=:
+
+- We direct them to container-local paths:
+
+  - =FLASHINFER_WORKSPACE_DIR=/tmp/flashinfer=
+  - =HOME=/tmp/home=
+
+These paths are writable by the container user and do not interfere with host
+filesystem layout.
+
+* GPT-OSS-120B Serving Configuration
+
+This section describes the concrete configuration used to serve
+=openai/gpt-oss-120b= with SGLang in a container-only environment.
+
+** Docker Run Command
+
+The serving container is launched with:
+
+#+begin_src bash
+export HF_TOKEN=YOUR_HF_TOKEN   # if the model requires auth; may be empty
+
+docker run --gpus all \
+  --shm-size 64g \
+  -p 30000:30000 \
+  -v "$HOME/sglang-hf-cache:/data/hf-cache" \
+  -e HF_TOKEN \
+  -e HF_HOME=/data/hf-cache \
+  -e HUGGINGFACE_HUB_CACHE=/data/hf-cache \
+  -e FLASHINFER_WORKSPACE_DIR=/tmp/flashinfer \
+  -e HOME=/tmp/home \
+  --ipc=host \
+  --user "$(id -u):$(id -g)" \
+  -v /etc/passwd:/etc/passwd:ro \
+  -v /etc/group:/etc/group:ro \
+  --name sglang-gptoss-120b-test \
+  lmsysorg/sglang:latest \
+  python3 -m sglang.launch_server \
+    --model-path openai/gpt-oss-120b \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --tp 8 \
+    --tool-server demo
+#+end_src
+
+Notes:
+
+- =--tp 8= assumes 8 GPUs and tensor-parallelism across them; adjust as needed.
+- =--tool-server demo= enables the demo tool server wiring. In practice, the
+  Python tool may require additional setup (e.g., fully configured gpt-oss tool
+  server) and may not be fully available in this base image.
+
+** Health Check and Smoke Test
+
+Once the container is running:
+
+- Health:
+
+  #+begin_src bash
+  curl http://localhost:30000/health
+  # expect a simple 200 OK response
+  #+end_src
+
+- Simple Responses API test:
+
+  #+begin_src bash
+  curl -sS -X POST http://localhost:30000/v1/responses \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer sk-test" \
+    -d '{
+      "model": "openai/gpt-oss-120b",
+      "input": "Say hello from GPT-OSS in one short sentence.",
+      "instructions": "You are a concise assistant."
+    }'
+  #+end_src
+
+This should return a JSON payload with =output= containing a short “Hello from
+GPT-OSS!” style response.
+
+* GSM8k Evaluation Pipeline (Container-Only)
+
+GSM8k evaluation is run *entirely inside the same container* to ensure that
+host Python is not modified.
+
+** Evaluation Script
+
+We use the built-in few-shot GSM8k evaluation script:
+
+- File: =python/sglang/test/few_shot_gsm8k.py=
+- Behavior:
+  - Downloads GSM8k test set from:
+    - =https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl=
+  - Uses =num_shots= few-shot examples prepended to each question.
+  - Calls the running SGLang server via =RuntimeEndpoint=.
+  - Parses numeric answers from model outputs and computes accuracy.
+
+** Running GSM8k Inside the Container
+
+Assuming the serving container =sglang-gptoss-120b-test= is running:
+
+#+begin_src bash
+docker exec sglang-gptoss-120b-test \
+  bash -lc 'cd /tmp && python3 -m sglang.test.few_shot_gsm8k \
+    --num-questions 1319 \
+    --parallel 64 \
+    --host http://127.0.0.1 \
+    --port 30000'
+#+end_src
+
+Key points:
+
+- We =cd /tmp= so that =dump_state_text("tmp_output_gsm8k.txt", ...)= can
+  write without hitting permission errors in the project tree.
+- =--num-questions 1319= runs the full GSM8k test set.
+- =--parallel 64= controls the internal evaluation concurrency.
+
+** GSM8k Metrics for GPT-OSS-120B
+
+In our run (container-only evaluation), the script reported:
+
+- =Accuracy: 0.864=
+- =Invalid: 0.011=
+- =Latency: 78.818 s= (for all 1319 examples)
+- =Output throughput: 5353.187 token/s=
+
+The =Invalid= rate is the fraction of problems where the script could not parse
+a valid numeric answer from the model’s output.
+
+** Exporting Per-Example Outputs
+
+The evaluation script writes full per-example outputs to:
+
+- Container path: =/tmp/tmp_output_gsm8k.txt=
+
+To examine these from the host without entering the container:
+
+#+begin_src bash
+mkdir -p "$HOME/sglang-gsm8k-logs"
+
+docker cp sglang-gptoss-120b-test:/tmp/tmp_output_gsm8k.txt \
+  "$HOME/sglang-gsm8k-logs/tmp_output_gsm8k.txt"
+#+end_src
+
+You can then inspect this file on the host to review individual prompts and
+model outputs, analyze failure modes, or build additional evaluation tooling.
+
+* Operational Considerations and Extensions
+
+** Reusing the Pattern for Other Models
+
+The container and evaluation pattern described above can be reused for other
+models:
+
+- Change:
+  - =--model-path openai/gpt-oss-120b=
+- To:
+  - Another HF or local model path supported by SGLang.
+
+GSM8k evaluation:
+
+- =few_shot_gsm8k.py= is model-agnostic and will work as long as the runtime
+  endpoint responds to the OpenAI-like generation calls it issues.
+
+** Speculative Decoding
+
+SGLang supports speculative decoding (e.g., EAGLE3) for GPT-OSS models:
+
+- Add flags when launching the server:
+
+  #+begin_src bash
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16
+  #+end_src
+
+- This can significantly increase decoding throughput, especially for small
+  batch sizes, at the cost of additional GPU memory and complexity.
+
+** Agentic Coding and Tools
+
+The server was started with =--tool-server demo=, which wires in demo tool
+support. For fully working agentic coding with a Python code interpreter and
+web search:
+
+- You may need:
+  - A properly configured =gpt-oss= tool server.
+  - Correct environment variables (e.g., =EXA_API_KEY= for search).
+- Once configured, GPT-OSS-120B can:
+  - Call the Python tool for heavy calculations.
+  - Use web search for knowledge lookups.
+
+These enhancements can be layered on top of the container and evaluation
+infrastructure described here without changing the overall deployment model.
+
+* Reproducibility Checklist
+
+To reproduce the GPT-OSS-120B setup and GSM8k evaluation:
+
+1. **Start the server container**
+
+   - Use the =docker run= command in this document, adjusting =HF_TOKEN= and
+     =--tp= as needed.
+
+2. **Verify health**
+
+   - =curl http://localhost:30000/health=
+
+3. **Run GSM8k evaluation inside the container**
+
+   - Use the =docker exec ... few_shot_gsm8k= command from the GSM8k section.
+
+4. **Export outputs**
+
+   - =docker cp= the =tmp_output_gsm8k.txt= from =/tmp= to a host directory.
+
+5. **Compare metrics**
+
+   - Confirm accuracy is close to ≈0.864, with similar latency and throughput,
+     allowing for minor variations in hardware and load.
+
+* SGLang Repo Architecture Overview
+
+** Top-Level Layout
+
+- `python/sglang/`: Core Python stack, including the frontend DSL (`lang/`), the serving runtime (`srt/`), JIT kernels (`jit_kernel/`), and multimodal/diffusion support (`multimodal_gen/`).
+- `sgl-kernel/`: Low-level kernel library providing C++/CUDA/CPU kernels and PyTorch extensions used by SGLang for attention, GEMM, MoE, quantization, KV cache, speculative decoding, and more.
+- `sgl-model-gateway/`: Rust-based model gateway / router that sits in front of SGLang workers and external providers, handling routing, policies, observability, and service discovery.
+- `docs/`: Sphinx documentation for getting started, advanced runtime features, deployment, platform guides, and model support.
+- `benchmark/`: Scenario-level benchmarks (e.g., GSM8k, MMLU, MT-Bench, long-context, JSON decoding, reasoning) plus kernel microbenchmarks.
+- `test/`: System and integration test suites organized by feature (models, kernels, distributed, openai_server, quantization, etc.).
+- `scripts/`: CI, release, metrics, and developer utilities (playgrounds, trace replay, version bumping).
+- `docker/`: Dockerfiles, compose files, and k8s manifests for SGLang and the model gateway.
+- `examples/`: End-to-end examples for the frontend DSL, runtime usage, diffusion, and monitoring.
+
+** Python SGLang Stack (python/sglang/)
+
+- `lang/`:
+  - Frontend DSL and public API for writing SGLang programs.
+  - IR definition and interpreter that run programs against different backends (local SRT, OpenAI, Anthropic, Vertex, etc.).
+  - Chat templates, sampling abstractions, and tracing utilities.
+- `srt/` (SGLang Runtime):
+  - Entry points and protocol servers (HTTP, gRPC, OpenAI-compatible endpoints, Anthropic/Ollama compatibility, tool server).
+  - Managers and schedulers for batching, tokenization, sessions, templates, and multimodal data.
+  - Model execution (`model_executor/`) and loading (`model_loader/`, `models/`) that turn a `--model-path` into an executable engine.
+  - Layers and kernel integration (`layers/`) that wire SGLang to `sgl-kernel` and JIT kernels, including attention backends and quantization.
+  - Distributed and disaggregation support (`distributed/`, `disaggregation/`, `batch_overlap/`, `batch_invariant_ops/`, `ray/`).
+  - Sampling, tokenization, observability, and debug utilities (`sampling/`, `tokenizer/`, `observability/`, `debug_utils/`).
+- `jit_kernel/`:
+  - Python-side JIT kernels for attention, quantization, KV cache, HiCache, MoE, rope, etc.
+  - Local `csrc/` and `include/` used to build and load kernels on demand, often faster moving than the packaged `sgl-kernel` library.
+- `multimodal_gen/`:
+  - Diffusion and multimodal generation engine, with configs, runtime pipelines, apps (ComfyUI/web UI), and custom kernels.
+  - Provides image/video generation capabilities parallel to the text-focused SRT engine.
+
+** Kernel Library (sgl-kernel/)
+
+- `csrc/` and `include/`:
+  - C++/CUDA/CPU kernel implementations for attention, GEMM, MoE, KV cache IO, grammar-based decoding, spatial ops, Mamba kernels, quantization, and speculative sampling.
+  - Shared headers (`sgl_kernel_ops.h`, `sgl_flash_kernel_ops.h`, `sgl_kernel_torch_shim.h`, `scalar_type.hpp`, etc.) define the public kernel API.
+- `python/sgl_kernel/`:
+  - Python bindings that expose these kernels as PyTorch ops, used by SRT and other consumers.
+- `benchmark/` and `tests/`:
+  - Microbenchmarks and correctness tests for individual kernels (GEMM, attention, MoE, quantization, KV cache IO, sampling, etc.).
+- Build entrypoints:
+  - `CMakeLists.txt`, `build.sh`, `Makefile`, and `pyproject*.toml` (with scikit-build) plus platform-specific setup scripts (ROCm, MUSA, CPU) for building wheels and extensions.
+
+** Rust Model Gateway (sgl-model-gateway/)
+
+- Purpose:
+  - High-performance model gateway / router that manages fleets of SGLang workers and external providers.
+  - Exposes OpenAI-compatible APIs, tokenizer APIs, and parser endpoints with advanced routing and resilience.
+- Core modules (`src/`):
+  - `app_context.rs` and `config/` set up application context, config types, and validation.
+  - `core/` manages worker registry, circuit breakers, retries, rate limiting, workflow engines, and metrics aggregation.
+  - `policies/` implements load-balancing and routing strategies (round robin, random, power-of-two, consistent hashing, tree-based, cache-aware, manual).
+  - `routers/` provides protocol-specific routers for OpenAI chat/embeddings/responses, HTTP/gRPC pipelines, conversations, tokenization, and parsing.
+  - `observability/` offers metrics, logging, and tracing; `server.rs` and `middleware.rs` host the HTTP server and cross-cutting middleware; `service_discovery.rs` integrates with external discovery systems.
+- Tests and E2E:
+  - `tests/` contains Rust tests grouped by API, routing, reliability, security, and spec conformance.
+  - `e2e_test/` contains Python-based end-to-end tests that spin up the gateway and workers to validate real API flows.
+
+** Benchmarks, Tests, and Ops Tooling
+
+- `benchmark/`:
+  - Scenario-level benchmarks for reasoning, math (GSM8k, MMLU), chat, long-context, JSON decoding, line retrieval, etc.
+  - Kernel-level benchmarks in `benchmark/kernels/` for attention, all-reduce, quantization, and other primitive ops.
+- `test/` (top-level):
+  - System and regression suites organized by feature (models, quantization, rotary, sampling, distributed, openai_server, disaggregation, etc.).
+  - Includes manual suites and registered suites (`test/registered/`) for nightly and CI runs.
+- `scripts/`:
+  - CI utilities (coverage, metrics export, HF cache prevalidation), release automation (version bumps, wheel index updates), and developer tools (trace replay, long-context examples, speculative decoding playgrounds).
+- `docker/` and `examples/`:
+  - Dockerfiles and compose/k8s manifests for SGLang servers and the Rust gateway.
+  - Example programs showing how to use the frontend DSL, runtime engine, diffusion pipelines, and monitoring stack.
+
+** End-to-End Mental Model
+
+- Workloads are expressed with the SGLang DSL in `python/sglang/lang/`.
+- The SGLang Runtime (`python/sglang/srt/`) executes those workloads on local hardware, orchestrating batching, scheduling, distributed execution, and sampling.
+- Performance-critical operations are implemented in `sgl-kernel/` and exposed to Python via both `sgl-kernel` and `jit_kernel/`.
+- The Rust gateway (`sgl-model-gateway/`) sits in front of one or more SGLang runtime instances (and other providers), handling routing, policies, reliability, and observability.
+- Benchmarks, tests, docs, and deployment tooling (under `benchmark/`, `test/`, `docs/`, `scripts/`, `docker/`, and `examples/`) validate and operationalize the entire stack.
