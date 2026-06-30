@@ -79,6 +79,18 @@ Its core features include:
 - [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
 - [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
 
+### Local development (mise, uv, just)
+
+The repo pins CLI versions in [`mise.toml`](mise.toml) (Python 3.12, uv, just). From the repository root:
+
+1. Install [mise](https://mise.jdx.dev/getting-started.html) and run `mise install` (or `just bootstrap`).
+2. Run `just sync` to create `python/.venv` and install the `dev` optional extra (`sglang[test]`) via [`uv`](https://docs.astral.sh/uv/) using [`python/pyproject.toml`](python/pyproject.toml) and [`python/uv.lock`](python/uv.lock).
+3. Point your IDE at `python/.venv` (`just venv-path` prints the path).
+
+All `uv` commands should use `--project python` (the Just recipes wrap this). After editing dependencies in `python/pyproject.toml`, refresh the lockfile with `uv lock` run from the `python/` directory (or your equivalent `uv lock --project python`). See [`python/pyproject.toml`](python/pyproject.toml) (`[tool.uv]`) for indexes and optional excludes; full install options remain in the [install guide](https://docs.sglang.io/get_started/install.html).
+
+Environment variables are indexed by topic in [`docker/ENVIRONMENT.md`](docker/ENVIRONMENT.md) (Docker/scripts vs in-process `SGLANG_*` in [`python/sglang/srt/environ.py`](python/sglang/srt/environ.py)).
+
 ## Benchmark and Performance
 Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/), [GB300 long context](https://lmsys.org/blog/2026-02-19-gb300-longctx/).
 

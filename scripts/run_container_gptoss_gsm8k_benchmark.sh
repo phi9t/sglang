@@ -116,6 +116,7 @@ docker exec "${CONTAINER_NAME}" \
     --port 30000'
 
 echo "[info] GSM8k benchmark completed" >&2
+GSM8K_LOG_DIR="${HOME}/sglang-gsm8k-logs"
 echo "[info] To inspect per-example outputs (if generated), run:" >&2
-echo "  mkdir -p \"$HOME/sglang-gsm8k-logs\"" >&2
-echo "  docker cp ${CONTAINER_NAME}:/tmp/tmp_output_gsm8k.txt \\"$HOME/sglang-gsm8k-logs/tmp_output_gsm8k.txt\\"" >&2
+echo "  mkdir -p $(printf '%q' "${GSM8K_LOG_DIR}")" >&2
+echo "  docker cp $(printf '%q' "${CONTAINER_NAME}"):/tmp/tmp_output_gsm8k.txt $(printf '%q' "${GSM8K_LOG_DIR}/tmp_output_gsm8k.txt")" >&2

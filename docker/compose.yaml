@@ -1,9 +1,18 @@
 services:
   sglang:
-    image: lmsysorg/sglang:latest
+    image: ${IMAGE:-lmsysorg/sglang:latest}
     container_name: sglang
+    shm_size: ${SHM_SIZE:-64g}
     volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      # Hugging Face cache (models, snapshots, etc.)
+      - ${HF_CACHE_DIR:-${HOME}/sglang-hf-cache}:/data/hf-cache
+
+      # SGLang + compiler caches (torch.compile/inductor/triton/deepgemm/flashinfer workspaces)
+      - ${SGLANG_CACHE_ROOT:-${HOME}/.cache/sglang}:/data/sglang-cache
+
+      # Run as host UID/GID; keep user lookups working
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
       # If you use modelscope, you need mount this directory
       # - ${HOME}/.cache/modelscope:/root/.cache/modelscope
     restart: always
@@ -13,23 +22,58 @@ services:
     # ports:
     #   - 30000:30000
     environment:
-      - HF_TOKEN=<secret>
+      # Optional Hugging Face token
+      HF_TOKEN: ${HF_TOKEN:-}
+
+      # Hugging Face caches
+      HF_HOME: /data/hf-cache
+      HUGGINGFACE_HUB_CACHE: /data/hf-cache
+      TRANSFORMERS_CACHE: /data/hf-cache/transformers
+      HF_DATASETS_CACHE: /data/hf-cache/datasets
+      HF_MODULES_CACHE: /data/hf-cache/modules
+
+      # SGLang cache base (used by SGLang torch.compile cache)
+      SGLANG_CACHE_DIR: /data/sglang-cache
+
+      # Compiler / kernel caches (may be overridden by SGLang per-run subdirs)
+      TORCHINDUCTOR_CACHE_DIR: /data/sglang-cache/torchinductor
+      TRITON_CACHE_DIR: /data/sglang-cache/triton
+
+      # DeepGEMM cache
+      SGLANG_DG_CACHE_DIR: /data/sglang-cache/deep_gemm
+
+      # FlashInfer workspace
+      FLASHINFER_WORKSPACE_DIR: /data/sglang-cache/flashinfer
+
+      # General caches
+      HOME: /data/sglang-cache/home
+      XDG_CACHE_HOME: /data/sglang-cache/xdg
+
+      # GPU selection (optional)
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-}
+
       # if you use modelscope to download model, you need set this environment
-      # - SGLANG_USE_MODELSCOPE=true
+      # SGLANG_USE_MODELSCOPE: "true"
     entrypoint: python3 -m sglang.launch_server
-    command: --model-path meta-llama/Llama-3.1-8B-Instruct
+    user: "${SGLANG_UID:-0}:${SGLANG_GID:-0}"
+    command: >-
+      --model-path ${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B}
       --host 0.0.0.0
-      --port 30000
+      --port ${PORT:-30000}
+      --tp ${TP:-8}
+      --trust-remote-code
+      ${EXTRA_ARGS:-}
     ulimits:
       memlock: -1
       stack: 67108864
     ipc: host
+    # curl is installed in lmsysorg/sglang images (docker/Dockerfile runtime stage).
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:${PORT:-30000}/health || exit 1"]
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]

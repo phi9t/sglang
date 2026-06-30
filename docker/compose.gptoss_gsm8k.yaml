@@ -38,5 +38,6 @@ services:
       - "${TP:-1}"
       - --tool-server
       - demo
+    # Official lmsysorg/sglang images install curl (docker/Dockerfile runtime stage).
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]

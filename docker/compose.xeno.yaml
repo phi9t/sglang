@@ -1,0 +1,10 @@
+# Xeno local GPT-OSS E2E entrypoint. Compose stacks for this repo live under docker/.
+# This file includes the GPT-OSS GSM8k / benchmark stack without duplicating services.
+#
+# Usage (from repo root):
+#   docker compose -f docker/compose.xeno.yaml up -d
+#   docker compose -f docker/compose.xeno.yaml down
+#
+# Requires Docker Compose v2.23+ for `include`.
+include:
+  - path: ./compose.gptoss_gsm8k.yaml

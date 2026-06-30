@@ -101,6 +101,16 @@ dependencies = [
   "zstandard",
 ]
 
+[tool.uv]
+# Omit transitive GPU stacks from resolution when mirroring system/CUDA installs; no globs (uv rule).
+exclude-dependencies = [
+  "torch",
+  "torchvision",
+  "torchaudio",
+  "jax",
+  "jaxlib",
+]
+
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
